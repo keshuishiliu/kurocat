@@ -28,7 +28,7 @@
 | --- | --- | --- | --- |
 | ① | **OBS 静态服务路径穿越**：请求行形如 `GET /C:/Windows/win.ini` 时，Windows 上 `Path::join` 遇到绝对路径会**替换**基准目录，可读取任意文件 | `src-tauri/src/obs.rs` | 新增 `sanitize_asset_path` 拒绝 `..`、`\`、`:`、NUL、前导 `/`、`is_absolute()`、百分号编码穿越、控制字符与 `<>"\|?*`；`load_asset` 再用 `canonicalize()` 做前缀校验 |
 | ② | **MCP HTTP 服务无鉴权**：`127.0.0.1:27420` 对任何 `POST` 即执行工具，任意网页都能借 DNS rebinding 或跨站表单调用（改皮肤、改设置） | `src-tauri/src/mcp.rs` | 新增 `is_loopback_host` / `is_loopback_origin`，`Host` 必须为回环地址，带 `Origin` 时必须也是回环页，`Origin: null` 直接拒绝。stdio / CLI / SDK 等原生客户端不带 `Origin`，不受影响 |
-| ③ | **更新信任链薄弱**：更新检查只信 JSON 里的 URL，可被伪造指向任意下载地址 | `src-tauri/src/updater.rs` | 新增 `validate_update_target`：`release_url` 必须锚定 `github.com/qianyiai/kurocat` 发布页，`download_url` 必须在同仓库 release 下，且哈希强制 64 位 sha256；另加 `is_safe_web_url` 限制外部链接协议 |
+| ③ | **更新信任链薄弱**：更新检查只信 JSON 里的 URL，可被伪造指向任意下载地址 | `src-tauri/src/updater.rs` | 新增 `validate_update_target`：`release_url` 必须锚定本仓库 `github.com/keshuishiliu/kurocat` 发布页，`download_url` 必须在同仓库 release 下，且哈希强制 64 位 sha256；另加 `is_safe_web_url` 限制外部链接协议 |
 | ④ | **CSP 为空**：`csp: null` 时前端被注入即可任意加载外部脚本 | `src-tauri/tauri.conf.json` | 改为白名单策略：`script-src 'self'`、`object-src 'none'`、`frame-src 'none'`、`form-action 'none'`，仅放行 IPC 与 `127.0.0.1:27421`。`devCsp` 保持 `null` 以便开发热更新 |
 
 > 审计结论：未发现后门。键鼠数据原本不落盘、不读剪贴板与窗口标题、无遥测，依赖树干净。
