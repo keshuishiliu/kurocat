@@ -71,7 +71,7 @@ interface UpdateProgressEvent {
   info: UpdateInfo | null;
 }
 
-let appVersion = '4.10.1';
+let appVersion = '4.11.0';
 let latestUpdateInfo: UpdateInfo | null = null;
 let updateBusy = false;
 let dismissedVersion: string | null = null;

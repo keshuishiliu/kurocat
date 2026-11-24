@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
+#[cfg(windows)]
+use std::path::Path;
 use std::path::PathBuf;
+#[cfg(windows)]
+use std::sync::OnceLock;
 
 fn default_cat_breed() -> String {
     "black".to_string()
@@ -201,13 +205,152 @@ impl Default for AppSettings {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 数据目录
+// ---------------------------------------------------------------------------
+// 安装版与绿色版共用一套规则：优先使用可执行文件同级的 `data/` 目录，让程序、
+// 设置、皮肤、输入记录都待在同一个文件夹里，整个目录拷走就等于搬家。
+// 只有该目录不可写时才退回 `%APPDATA%\kuro-cat-pet`——典型场景是装在
+// `C:\Program Files`、只读介质上，或 ACL 受限的共享目录。
+//
+// 解析结果进程内缓存：目录探测（要试写一个临时文件）每个进程只做一次。
+//
+// macOS / Linux 保持原样不动。macOS 往 `.app` 包内写文件会破坏代码签名，
+// Linux 的 AppImage 挂载点是只读的，deb 装到 `/usr` 也无写权限。
+
+#[cfg(windows)]
+static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// `%APPDATA%\kuro-cat-pet`：Windows 上本地目录不可用时的兜底位置。
+#[cfg(windows)]
+fn roaming_dir() -> PathBuf {
+    std::env::var("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("kuro-cat-pet")
+}
+
+/// 系统目录必然不可写，直接判定，省掉无谓的试写。
+#[cfg(windows)]
+fn is_system_dir(dir: &Path) -> bool {
+    let lower = dir.to_string_lossy().to_ascii_lowercase();
+    for var in [
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "PROGRAMW6432",
+        "SYSTEMROOT",
+        "WINDIR",
+    ] {
+        let Ok(base) = std::env::var(var) else { continue };
+        let base = base
+            .trim_end_matches(|c| c == '\\' || c == '/')
+            .to_ascii_lowercase();
+        if base.is_empty() {
+            continue;
+        }
+        if lower == base
+            || lower.starts_with(&format!("{base}\\"))
+            || lower.starts_with(&format!("{base}/"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// 试写一个临时文件判断目录可写性，写完立刻删除。
+/// 用 pid 命名避免多实例撞名；先清理可能残留的同名文件，免得误判为不可写。
+#[cfg(windows)]
+fn probe_writable(dir: &Path) -> bool {
+    let probe = dir.join(format!(".kurocat-probe-{}", std::process::id()));
+    let _ = fs::remove_file(&probe);
+    let ok = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .is_ok();
+    if ok {
+        let _ = fs::remove_file(&probe);
+    }
+    ok
+}
+
+/// 可用的本地数据目录；不可用时返回 `None`。
+#[cfg(windows)]
+fn local_data_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    if is_system_dir(dir) {
+        return None;
+    }
+    if !probe_writable(dir) {
+        return None;
+    }
+    Some(dir.join("data"))
+}
+
+#[cfg(windows)]
+fn resolve_data_dir() -> PathBuf {
+    local_data_dir().unwrap_or_else(roaming_dir)
+}
+
+/// 递归复制目录，返回复制的总字节数。符号链接等特殊文件跳过。
+#[cfg(windows)]
+fn copy_dir_all(from: &Path, to: &Path) -> std::io::Result<u64> {
+    fs::create_dir_all(to)?;
+    let mut total = 0u64;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let target = to.join(entry.file_name());
+        if file_type.is_dir() {
+            total += copy_dir_all(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            total += fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(total)
+}
+
+/// 启动时调用一次，务必在任何代码读写设置之前完成目录判定。
+///
+/// 升级时有个必须处理的坑：旧版本数据在 `%APPDATA%\kuro-cat-pet`，新规则改用
+/// 程序同级 `data/`，直接切过去会让用户以为记录和皮肤全丢了。所以首次启用
+/// 本地目录时把旧数据**复制**过来——只复制不删除，旧目录原样保留作备份。
+/// 复制失败则整段放弃并继续用旧位置：宁可维持现状，也不能留下半份数据。
+#[cfg(windows)]
+pub fn prepare_data_dir() {
+    let resolved = resolve_data_dir();
+    if resolved == roaming_dir() || resolved.exists() {
+        let _ = DATA_DIR.set(resolved);
+        return;
+    }
+    let old = roaming_dir();
+    if old.is_dir() {
+        match copy_dir_all(&old, &resolved) {
+            Ok(bytes) => eprintln!(
+                "[config] 旧数据已复制到 {}（{bytes} 字节），原目录保留在 {}",
+                resolved.display(),
+                old.display()
+            ),
+            Err(e) => {
+                let _ = fs::remove_dir_all(&resolved);
+                eprintln!("[config] 复制到本地目录失败，继续使用 %APPDATA%: {e}");
+                let _ = DATA_DIR.set(old);
+                return;
+            }
+        }
+    }
+    let _ = DATA_DIR.set(resolved);
+}
+
+#[cfg(not(windows))]
+pub fn prepare_data_dir() {}
+
 pub fn app_data_dir() -> PathBuf {
     #[cfg(windows)]
     {
-        let base = std::env::var("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("."));
-        base.join("kuro-cat-pet")
+        DATA_DIR.get_or_init(resolve_data_dir).clone()
     }
     #[cfg(target_os = "macos")]
     {
@@ -459,6 +602,53 @@ pub fn create_desktop_shortcut() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 递归复制必须完整搬走子目录与文件，返回值累计字节数。
+    /// 迁移旧数据全靠它，漏一层就会让用户以为记录丢了。
+    #[cfg(windows)]
+    #[test]
+    fn copy_dir_all_copies_nested_tree() {
+        let root = std::env::temp_dir().join(format!("kurocat-copy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let from = root.join("from");
+        let to = root.join("to");
+        fs::create_dir_all(from.join("input-log")).unwrap();
+        fs::create_dir_all(from.join("a/b")).unwrap();
+        fs::write(from.join("settings.json"), b"{}").unwrap();
+        fs::write(from.join("input-log/events.db"), b"db").unwrap();
+        fs::write(from.join("a/b/deep.txt"), b"world!").unwrap();
+
+        let bytes = copy_dir_all(&from, &to).unwrap();
+        assert_eq!(bytes, 2 + 2 + 6);
+        assert_eq!(fs::read_to_string(to.join("settings.json")).unwrap(), "{}");
+        assert_eq!(
+            fs::read_to_string(to.join("input-log/events.db")).unwrap(),
+            "db"
+        );
+        assert_eq!(fs::read_to_string(to.join("a/b/deep.txt")).unwrap(), "world!");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Program Files / Windows 一定不可写，直接判死；普通目录不能误伤。
+    /// 误判成系统目录的后果是数据被踢回 %APPDATA%，绿色版直接失效。
+    #[cfg(windows)]
+    #[test]
+    fn system_dirs_are_rejected_but_normal_dirs_are_not() {
+        for var in ["PROGRAMFILES", "SYSTEMROOT"] {
+            if let Ok(base) = std::env::var(var) {
+                if base.is_empty() {
+                    continue;
+                }
+                assert!(is_system_dir(Path::new(&base)), "{var} itself");
+                assert!(
+                    is_system_dir(&Path::new(&base).join("KuroCat")),
+                    "{var} subdir"
+                );
+            }
+        }
+        assert!(!is_system_dir(Path::new(r"D:\portable\kurocat")));
+        assert!(!is_system_dir(Path::new(r"C:\Users")));
+    }
 
     #[test]
     fn tail_key_mode_normalizes_safely() {

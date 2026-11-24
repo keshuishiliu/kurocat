@@ -5,18 +5,19 @@
 
 # 🐈‍⬛ KuroCat（衍生修改版）
 
-**当前版本 `v4.10.1`**（= 上游 v4.9.1 + 本仓库改动）。App 内「检查更新」与更新包地址校验已改为锚定本仓库 [keshuishiliu/kurocat](https://github.com/keshuishiliu/kurocat) Releases，不再跟随上游发布通道。
+**当前版本 `v4.11.0`**（= 上游 v4.9.1 + 本仓库改动）。App 内「检查更新」与更新包地址校验已改为锚定本仓库 [keshuishiliu/kurocat](https://github.com/keshuishiliu/kurocat) Releases，不再跟随上游发布通道。
 
-**下载**：[Releases · v4.10.1](https://github.com/keshuishiliu/kurocat/releases/latest) —— Windows 安装包 / macOS Universal `dmg` / Linux `deb` + `AppImage`，由 GitHub Actions 三平台构建，安装包未签名。
+**下载**：[Releases · v4.11.0](https://github.com/keshuishiliu/kurocat/releases/latest) —— Windows 安装包 / **Windows 免安装版（exe 与 zip）** / macOS Universal `dmg` / Linux `deb` + `AppImage`，由 GitHub Actions 三平台构建，安装包未签名。
 
 ## 目录
 
 1. [安全加固](#一安全加固)
-2. [新增功能：键鼠输入记录](#二新增功能键鼠输入记录)
-3. [新增配置项](#三新增配置项)
-4. [改动文件清单](#四改动文件清单)
-5. [构建与验证状态](#五构建与验证状态)
-6. [已知限制](#六已知限制)
+2. [绿色免安装版](#二绿色免安装版)
+3. [新增功能：键鼠输入记录](#三新增功能键鼠输入记录)
+4. [新增配置项](#四新增配置项)
+5. [改动文件清单](#五改动文件清单)
+6. [构建与验证状态](#六构建与验证状态)
+7. [已知限制](#七已知限制)
 
 ---
 
@@ -35,7 +36,41 @@
 
 ---
 
-## 二、新增功能：键鼠输入记录
+## 二、绿色免安装版
+
+Windows 额外提供**免安装单文件**：下载 `KuroCat-<版本>-windows-x64.zip`，解压到任意可写文件夹，双击 `KuroCat.exe` 即可运行。不写注册表、不装服务、不建快捷方式，删掉整个文件夹就是卸载。
+
+**安装版与绿色版共用同一套数据规则**：
+
+| 情况 | 数据位置 |
+| --- | --- |
+| exe 所在目录可写（绝大多数情况） | `<exe 目录>\data\` |
+| 不可写：`C:\Program Files`、`C:\Windows`、只读介质、ACL 受限的共享目录 | `%APPDATA%\kuro-cat-pet\` |
+
+判定在进程启动时做一次、结果缓存。可写性靠「试写一个临时文件再删掉」确认，不靠权限位推断——Windows 的 ACL 无法从路径猜出来。系统目录（`PROGRAMFILES`、`SYSTEMROOT` 等）直接判定为不可写，连试写都省了。
+
+因此装到 `%LOCALAPPDATA%` 的安装版也把数据放在自己的 `data\` 里：**拷走整个文件夹，设置、皮肤、输入记录一起搬家**。
+
+### 升级时的数据迁移
+
+旧版本（≤ v4.10.1）的数据在 `%APPDATA%\kuro-cat-pet`。新版本首次启动若发现 `data\` 尚未建立，会把旧目录**复制**过去——只复制、不删除，原目录原样保留作备份。复制失败则整段放弃并继续用旧位置：宁可维持现状，也不留下半份数据。
+
+### 便携版自更新
+
+上游原本就写了这条路：`detect_install_kind()` 在 exe 同级找不到 `uninstall.exe` 时判定为 `windows-portable`，更新时选 `*-windows-x64.exe`，把运行中的 exe 改名 `.exe.old`、复制新版就位、带 `--wait-pid` + `--cleanup-old-exe` 重启。所以绿色版更新后仍然是绿色版，不会偷偷变成安装版。
+
+### 边界
+
+- **WebView2 不附带**：裸 exe 不含运行时，依赖系统已装（Win11 与近年 Win10 内置）。若在 exe 同级放一个 `WebView2Runtime\`（内含 `msedgewebview2.exe`），程序会自动改用这份本地运行时——上游已支持该路径，可用来兼容没有 WebView2 的旧系统。
+- **多用户不隔离**：`data\` 不按 Windows 账户区分。放在公共目录时，同机其他账户能读到键盘记录——这是绿色版的固有语义。
+- **升级与卸载都不动数据**：查过 Tauri 的 NSIS 模板——安装时先 `SetOutPath` 再覆盖文件，不调用旧版卸载器、也不递归清目录；卸载时只逐个 `Delete` 程序文件，末尾那句 `RMDir "$INSTDIR"` 不带 `/r`，删不掉非空目录。因此 `data\` 在升级、卸载、卸载后重装三种情况下都会原样保留。
+- **卸载会留一个空壳目录**：正因为 `data\` 保住了，安装目录删不干净，卸载后 `%LOCALAPPDATA%\KuroCat\` 会只剩一个 `data\`。想彻底清掉就把整个文件夹删了——但先确认里面的记录不再需要。
+- **WebView2 缓存仍在 `%LOCALAPPDATA%`**：便携版启动时会把 Chromium 的 profile 指到 `%LOCALAPPDATA%\KuroCat\EBWebView-Win7`（上游既有逻辑，用于隔离固定版本运行时）。这是可再生的缓存，不含设置与记录，所以没有塞进 `data\`。
+- **macOS / Linux 未改**：往 `.app` 包内写文件会破坏代码签名，AppImage 挂载点只读，deb 装到 `/usr` 无写权限，这两个平台仍用 `~/Library/Application Support` 与 `~/.config`。
+
+---
+
+## 三、新增功能：键鼠输入记录
 
 本地统计「敲了多少键、在哪个程序里、什么时候活跃」。**默认关闭**，数据只写本机，不上传任何地方。
 
@@ -60,7 +95,7 @@
 
 ### 存储结构
 
-目录：`%APPDATA%\kuro-cat-pet\input-log\`（macOS 为 `~/Library/Application Support/kuro-cat-pet/input-log/`）
+目录：`<数据目录>\input-log\`。数据目录见 [绿色免安装版](#二绿色免安装版)——可写时是 `<exe 目录>\data\`，否则为 `%APPDATA%\kuro-cat-pet\`（macOS 为 `~/Library/Application Support/kuro-cat-pet/`）
 
 **`events.db`**——明细，**按月分表** `events_YYYYMM`，跨月查询自动 UNION：
 
@@ -143,9 +178,9 @@ timestamp,local_time,kind,target,flags,app,x,y
 
 ---
 
-## 三、新增配置项
+## 四、新增配置项
 
-配置文件：`%APPDATA%\kuro-cat-pet\settings.json`（macOS 见上方对照）。四个字段全部带 `serde` 默认值，**旧配置文件无需迁移**。
+配置文件：`<数据目录>\settings.json`（数据目录规则见 [绿色免安装版](#二绿色免安装版)）。四个字段全部带 `serde` 默认值，**旧配置文件无需迁移**。
 
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
@@ -156,9 +191,9 @@ timestamp,local_time,kind,target,flags,app,x,y
 
 ---
 
-## 四、改动文件清单
+## 五、改动文件清单
 
-相对上游 v4.9.1：**14 个文件修改 + 5 个文件新增，+651 / −17 行**（不含新增文件的合计约 3 260 行）。
+相对上游 v4.9.1：**15 个文件修改 + 5 个文件新增，+913 / −32 行**（新增文件合计约 3 257 行）。
 
 ### 新增
 
@@ -179,7 +214,8 @@ timestamp,local_time,kind,target,flags,app,x,y
 | `src-tauri/src/updater.rs` | +109 | 更新来源锚定 + sha256 长度校验 + 外链协议白名单 |
 | `src-tauri/src/input_hook.rs` | +95 | Shift/Caps 原子量、丢 repeat 与全部抬起、移动/滚轮不入库、缓存光标坐标供点击使用、`recorder::push()` |
 | `src-tauri/src/obs.rs` | +54 | 资源路径净化 + `canonicalize` 前缀校验 |
-| `src-tauri/src/config.rs` | +34 | 4 个字段 + 2 个 normalize |
+| `src-tauri/src/config.rs` | +194/−4 | 4 个字段 + 2 个 normalize；数据目录解析（本地 `data/` 优先、不可写回退 `%APPDATA%`、旧数据复制迁移）与 2 个单测 |
+| `.github/workflows/release.yml` | +50/−4 | Windows 额外产出裸 exe 与 zip，供绿色版分发与自更新 |
 | `src-tauri/Cargo.toml` | +5 | `rusqlite`（bundled，自带 SQLite 源码）+ `chrono` |
 | `src-tauri/capabilities/default.json` | +7 | 允许 `stats` 窗口 |
 | `src-tauri/tauri.conf.json` | ±3 | CSP 白名单 |
@@ -188,7 +224,7 @@ timestamp,local_time,kind,target,flags,app,x,y
 
 ---
 
-## 五、构建与验证状态
+## 六、构建与验证状态
 
 依赖：Node.js 18+、Rust 工具链、MSVC Build Tools（Windows）。
 
@@ -207,13 +243,13 @@ cd src-tauri && cargo build
 | 后端全部 SQL 实跑 | ✅ 用 sqlite3 逐条执行：DDL 幂等、四表 upsert 累加、六维查询、`LIKE 'events\_%' ESCAPE`、边界 `DELETE`、`DROP` + `incremental_vacuum` |
 | 界面三页布局 | ✅ 浏览器截图核对，修掉侧栏路径词中折断、趋势图末尾轴标签重叠 |
 | **Rust 侧编译** | ✅ **GitHub Actions 三平台全通过**（Windows / macOS Universal / Linux amd64 + arm64），`cargo test` 单测通过 |
-| 产物 | ✅ Windows NSIS 安装包 2.54 MB、macOS Universal dmg 7.03 MB、Linux deb 2.90 MB + AppImage 77.98 MB |
+| 产物 | ✅ 每版 9 个：Windows 安装包 + **免安装 exe** + **免安装 zip**、macOS Universal dmg 与 app.tar.gz、Linux amd64/arm64 各出 deb + AppImage |
 
 开发机本身没装 Rust 工具链，编译与打包由 `.github/workflows/release.yml` 在推送 `v*` 标签时于 GitHub 托管机上完成，产物自动挂到 Release。本地想自己编，装 rustup + MSVC Build Tools 后执行上面的命令即可。
 
 ---
 
-## 六、已知限制
+## 七、已知限制
 
 1. **中文输入法上屏内容不可见**。低级钩子只能拿到物理按键（你按了 `n` `i` `h` `a` `o`），拿不到候选词与上屏汉字。这是 Windows 钩子层的架构限制，不是实现缺陷——要拿到输入法结果只能读窗口文本，那等于记录输入框内容，本项目不做。
 2. **长按只记 1 条**。丢弃自动重复是「只记按下」的自然推论：按住某键 3 秒，库里是 1 条记录。
@@ -221,10 +257,11 @@ cd src-tauri && cargo build
 4. **断电最多丢约 500 ms**。`synchronous = NORMAL` 的取舍，换取写放大显著下降。
 5. **反作弊网游**下建议先开「暂停监听并隐藏（游戏反作弊护航）」，与上游行为一致。
 6. 明细表按月分表，**跨年跨月的「全部」查询**会 UNION 所有月份表；记录了十年以上时首屏统计会变慢（预聚合四表不受影响）。
+7. **数据目录不按 Windows 账户隔离**。放在程序同级 `data/` 后，同一台机器的多个用户共读同一份设置与记录；把程序放在公共目录时尤其要注意，键盘记录对其他账户是可见的。
 
 ---
 
-## 七、协议
+## 八、协议
 
 本项目以 [MIT License](LICENSE) 发布，许可证全文与版权声明见仓库根目录的 [`LICENSE`](LICENSE)。
 

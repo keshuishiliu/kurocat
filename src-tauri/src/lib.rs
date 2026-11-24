@@ -206,6 +206,9 @@ pub fn shutdown_pet_windows() {
 }
 
 pub fn run_mcp_stdio() {
+    // 独立进程入口，不经过 run()，必须自己完成数据目录判定，
+    // 否则 MCP 读到的是 data/ 的空设置而不是用户实际用的那份。
+    config::prepare_data_dir();
     mcp::run_stdio_mcp();
 }
 
@@ -2073,7 +2076,14 @@ pub fn run() {
     #[cfg(windows)]
     {
         win_wait_for_previous_pid_if_requested();
+        // 必须在等待旧进程退出之后：否则可能复制到正被写入的数据库文件。
+        // 也必须在任何 load_settings 之前：目录一旦定下，整个进程不再变更。
+        config::prepare_data_dir();
         win_configure_local_webview2_runtime();
+    }
+    #[cfg(not(windows))]
+    {
+        config::prepare_data_dir();
     }
     #[cfg(target_os = "linux")]
     {

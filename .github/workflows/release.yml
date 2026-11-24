@@ -50,15 +50,57 @@ jobs:
       - name: Build Tauri app (Windows x64 - 65% Classic Installer)
         run: npm run tauri -- build --bundles nsis
 
-      - name: Rename Windows installer asset
+      - name: Package Windows assets (installer + portable)
         shell: pwsh
         run: |
           $tag = if ($env:GITHUB_REF_NAME -match '^v') { $env:GITHUB_REF_NAME } else { 'latest' }
           $ver = $tag.TrimStart('v')
+
           $nsis = Get-ChildItem "src-tauri/target/release/bundle/nsis/*-setup.exe" | Select-Object -First 1
-          if ($nsis) {
-            Copy-Item $nsis.FullName "KuroCat-$ver-x64-setup.exe"
-          }
+          if (-not $nsis) { throw "NSIS installer not found under bundle/nsis" }
+          Copy-Item $nsis.FullName "KuroCat-$ver-x64-setup.exe"
+
+          # 裸 exe 即绿色版。文件名必须以 -windows-x64.exe 结尾，
+          # updater.rs 的 detect_install_kind/select_asset 据此判定便携模式。
+          $bare = "src-tauri/target/release/KuroCat.exe"
+          if (-not (Test-Path $bare)) { throw "portable exe not found at $bare" }
+          Copy-Item $bare "KuroCat-$ver-windows-x64.exe"
+
+          # 再打一个 zip：浏览器容易直接拦截无签名 exe，压缩包至少能先落地
+          $stage = "portable-stage"
+          if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item $bare "$stage/KuroCat.exe"
+          $lines = @(
+            'KuroCat 绿色免安装版 v' + $ver,
+            '',
+            '用法',
+            '  1. 解压到任意可写的文件夹（不要放 C:\Program Files，那里没有写权限）。',
+            '  2. 双击 KuroCat.exe 即可运行。',
+            '  3. 设置、皮肤、输入记录都会自动生成在同目录的 data 文件夹里。',
+            '',
+            '数据位置',
+            '  默认：与本 exe 同级的 data\',
+            '  若该目录不可写：%APPDATA%\kuro-cat-pet\（与安装版相同）',
+            '',
+            '卸载',
+            '  关闭程序，直接删掉整个文件夹即可，不写注册表、不留残留。',
+            '  注意：data 文件夹里有全部设置和输入记录，删之前请确认。',
+            '',
+            '系统要求',
+            '  Windows 10 1803 及以上 / Windows 11。',
+            '  需要 Microsoft Edge WebView2 运行时（Win11 与近年 Win10 已内置）。',
+            '  若提示缺少 WebView2，请安装：https://go.microsoft.com/fwlink/p/?LinkId=2124703',
+            '',
+            '首次运行会弹出 SmartScreen 提示（未签名的开源程序），',
+            '点“更多信息” → “仍要运行” 即可。'
+          )
+          ($lines -join "`r`n") | Set-Content -Path "$stage/README.txt" -Encoding utf8
+          Compress-Archive -Path "$stage/*" -DestinationPath "KuroCat-$ver-windows-x64.zip" -Force
+
+          Get-ChildItem "KuroCat-$ver-*" |
+            Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,2)}} |
+            Format-Table -AutoSize
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
@@ -66,6 +108,8 @@ jobs:
           name: kurocat-windows-x64
           path: |
             KuroCat-*-x64-setup.exe
+            KuroCat-*-windows-x64.exe
+            KuroCat-*-windows-x64.zip
 
       - name: Publish Windows assets to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -74,6 +118,8 @@ jobs:
           draft: true
           files: |
             KuroCat-*-x64-setup.exe
+            KuroCat-*-windows-x64.exe
+            KuroCat-*-windows-x64.zip
 
   build-macos:
     if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.linux_only) }}

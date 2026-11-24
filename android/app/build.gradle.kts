@@ -14,7 +14,7 @@ android {
         minSdk = 26
         targetSdk = 35
         versionCode = 40901
-        versionName = "4.10.1"
+        versionName = "4.11.0"
     }
 
     val signingPropsFile = File("${System.getProperty("user.home")}/.kurocat-android/signing.properties")
