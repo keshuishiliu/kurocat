@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde_json::json;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -176,7 +176,32 @@ fn sanitize_asset_path(raw_path: &str) -> Option<String> {
     if trimmed.is_empty() || trimmed == "obs" || trimmed == "obs/" {
         return Some("obs.html".to_string());
     }
-    if trimmed.contains("..") || trimmed.contains('\\') || trimmed.contains('\0') {
+    // SECURITY: this value is later joined onto the bundled `dist` directory. On Windows
+    // `Path::join` REPLACES the base when the argument is absolute, so a request line like
+    // `GET /C:/Windows/win.ini` would otherwise escape the asset root and disclose any file.
+    // Reject traversal, NUL, separators, drive letters / UNC prefixes, and absolutely any
+    // path component that is not a plain relative file name.
+    if trimmed.contains("..")
+        || trimmed.contains('\\')
+        || trimmed.contains('\0')
+        || trimmed.contains(':')
+        || trimmed.starts_with('/')
+        || Path::new(trimmed).is_absolute()
+    {
+        return None;
+    }
+    // Percent-encoded traversal (`%2e%2e`, `%2f`, `%5c`). We never URL-decode, but refuse it
+    // anyway so a future "decode then serve" change cannot silently reopen the hole.
+    let lowered = trimmed.to_ascii_lowercase();
+    if lowered.contains("%2e") || lowered.contains("%2f") || lowered.contains("%5c") {
+        return None;
+    }
+    // Windows-invalid / shell-hostile characters and control chars have no business in an
+    // asset name; refuse them rather than relying on the OS to fail the read.
+    if trimmed
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '<' | '>' | '"' | '|' | '?' | '*'))
+    {
         return None;
     }
     Some(trimmed.to_string())
@@ -212,9 +237,16 @@ fn load_asset(app: &AppHandle, rel_path: &str) -> Option<(Vec<u8>, String)> {
     // Development fallback when running `cargo run` / `tauri dev` against built `../dist`
     let dev_dist = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
-        .join("dist")
-        .join(rel_path);
-    if let Ok(bytes) = std::fs::read(&dev_dist) {
+        .join("dist");
+    let candidate = dev_dist.join(rel_path);
+    // SECURITY: second line of defence. Even if a caller bypasses `sanitize_asset_path`,
+    // resolve the real path (following symlinks) and verify it still lives inside `dist`.
+    let real = candidate.canonicalize().ok()?;
+    let root = dev_dist.canonicalize().ok()?;
+    if !real.starts_with(&root) {
+        return None;
+    }
+    if let Ok(bytes) = std::fs::read(&real) {
         return Some((bytes, guess_mime(rel_path).to_string()));
     }
     None
@@ -406,6 +438,18 @@ mod tests {
         );
         assert_eq!(sanitize_asset_path("/../Cargo.toml"), None);
         assert_eq!(sanitize_asset_path("/assets/..\\secret"), None);
+    }
+
+    #[test]
+    fn blocks_windows_absolute_paths_that_escape_dist() {
+        // Regression: `Path::join` replaces the base for absolute paths, so these used to
+        // be served straight off disk (`curl http://127.0.0.1:27421/C:/Windows/win.ini`).
+        assert_eq!(sanitize_asset_path("/C:/Windows/win.ini"), None);
+        assert_eq!(sanitize_asset_path("/C:/Users/x/.ssh/id_rsa"), None);
+        assert_eq!(sanitize_asset_path("/c:/windows/win.ini"), None);
+        assert_eq!(sanitize_asset_path("/\\\\server\\share\\evil.exe"), None);
+        assert_eq!(sanitize_asset_path("/%2e%2e/secret"), None);
+        assert_eq!(sanitize_asset_path("/assets/app.js?"), Some("assets/app.js".to_string()));
     }
 
     #[test]

@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter};
 
-const REPO_API_LATEST: &str = "https://api.github.com/repos/qianyiai/kurocat/releases/latest";
-const REPO_RELEASES_PAGE: &str = "https://github.com/qianyiai/kurocat/releases/latest";
+const REPO_API_LATEST: &str = "https://api.github.com/repos/keshuishiliu/kurocat/releases/latest";
+const REPO_RELEASES_PAGE: &str = "https://github.com/keshuishiliu/kurocat/releases/latest";
 
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -674,7 +674,29 @@ fn emit_progress(app: &AppHandle, stage: &str, message: impl Into<String>, info:
     );
 }
 
+/// Only plain http(s) URLs may ever be handed to the OS shell.
+/// Without this, a compromised renderer could pass `file:///...exe` or a UNC path
+/// (`\\host\share\x.exe`) to `ShellExecuteW` and get arbitrary code launched.
+fn is_safe_web_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let rest = if let Some(r) = lower.strip_prefix("https://") {
+        r
+    } else if let Some(r) = lower.strip_prefix("http://") {
+        r
+    } else {
+        return false;
+    };
+    !rest.is_empty()
+        && !rest.contains('\\')
+        && !rest.contains('@')
+        && !rest.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
 pub fn open_url_in_browser(url: &str) {
+    if !is_safe_web_url(url) {
+        return;
+    }
     #[cfg(windows)]
     {
         use std::ptr::{null, null_mut};
@@ -1020,6 +1042,34 @@ fn install_macos_update(app: &AppHandle, info: &UpdateInfo) -> Result<(), String
     Ok(())
 }
 
+/// Our own release channel. `install_update` is invoked from the renderer with a full
+/// `UpdateInfo`, so every field it supplies is untrusted until re-anchored to this path.
+const RELEASE_PAGE_PREFIX: &str = "https://github.com/keshuishiliu/kurocat/releases";
+const RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/keshuishiliu/kurocat/releases/download/";
+
+/// Re-anchors a renderer-supplied `UpdateInfo` to the project's own GitHub release path and
+/// refuses anything that cannot be integrity-checked. Without this, a compromised renderer
+/// could point `downloadUrl` at an attacker-hosted installer and have it silently executed.
+fn validate_update_target(info: &UpdateInfo) -> Result<(), String> {
+    if !info.release_url.starts_with(RELEASE_PAGE_PREFIX) {
+        return Err(format!("更新来源不在本项目发布页，已拒绝：{}", info.release_url));
+    }
+    if let Some(url) = info.download_url.as_deref() {
+        if !url.is_empty() && !url.starts_with(RELEASE_DOWNLOAD_PREFIX) {
+            return Err(format!("更新包地址不在本项目 release 下，已拒绝：{}", url));
+        }
+    }
+    let hash_ok = info
+        .asset_sha256
+        .as_deref()
+        .map(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()))
+        .unwrap_or(false);
+    if !hash_ok {
+        return Err("更新包缺少可校验的 SHA-256 摘要，已拒绝安装".to_string());
+    }
+    Ok(())
+}
+
 pub fn perform_update_install(app: &AppHandle, info: UpdateInfo) -> Result<(), String> {
     if !info.has_update {
         emit_progress(
@@ -1029,6 +1079,12 @@ pub fn perform_update_install(app: &AppHandle, info: UpdateInfo) -> Result<(), S
             Some(info),
         );
         return Ok(());
+    }
+
+    // SECURITY: fail closed before any download or process launch.
+    if let Err(err) = validate_update_target(&info) {
+        emit_progress(app, "error", err.clone(), Some(info));
+        return Err(err);
     }
 
     #[cfg(windows)]
@@ -1122,13 +1178,66 @@ mod tests {
     }
 
     #[test]
+    fn only_web_urls_reach_the_os_shell() {
+        assert!(is_safe_web_url("https://github.com/keshuishiliu/kurocat/releases/latest"));
+        assert!(is_safe_web_url("http://127.0.0.1:27421/obs"));
+        assert!(!is_safe_web_url("file:///C:/Windows/System32/cmd.exe"));
+        assert!(!is_safe_web_url("\\\\attacker\\share\\payload.exe"));
+        assert!(!is_safe_web_url("C:\\Windows\\System32\\calc.exe"));
+        assert!(!is_safe_web_url("https://localhost@evil.example/x"));
+        assert!(!is_safe_web_url("javascript:alert(1)"));
+        assert!(!is_safe_web_url(""));
+    }
+
+    #[test]
+    fn rejects_update_info_that_escapes_the_official_release_path() {
+        let official = UpdateInfo {
+            current_version: "4.9.1".to_string(),
+            latest_version: "4.9.2".to_string(),
+            has_update: true,
+            release_url: "https://github.com/keshuishiliu/kurocat/releases/tag/v4.10.1".to_string(),
+            asset_name: Some("KuroCat_4.9.2_x64-setup.exe".to_string()),
+            download_url: Some(
+                "https://github.com/keshuishiliu/kurocat/releases/download/v4.10.1/KuroCat-4.10.1-x64-setup.exe"
+                    .to_string(),
+            ),
+            asset_sha256: Some(
+                "05c1be2c444f5303770f6d59e216bc0ed7b69321fc44368e4ec231405570f950".to_string(),
+            ),
+            asset_size: Some(9_700_000),
+            install_kind: "windows".to_string(),
+            notes_summary: String::new(),
+        };
+        assert!(validate_update_target(&official).is_ok());
+
+        let mut foreign_host = official.clone();
+        foreign_host.download_url =
+            Some("https://evil.example/KuroCat-setup.exe".to_string());
+        assert!(validate_update_target(&foreign_host).is_err());
+
+        // A look-alike path on github.com itself must also be refused.
+        let mut other_repo = official.clone();
+        other_repo.download_url =
+            Some("https://github.com/attacker/kurocat/releases/download/v1/x-setup.exe".to_string());
+        assert!(validate_update_target(&other_repo).is_err());
+
+        let mut no_hash = official.clone();
+        no_hash.asset_sha256 = None;
+        assert!(validate_update_target(&no_hash).is_err());
+
+        let mut short_hash = official.clone();
+        short_hash.asset_sha256 = Some("deadbeef".to_string());
+        assert!(validate_update_target(&short_hash).is_err());
+    }
+
+    #[test]
     fn http_url_parser_handles_github_endpoints() {
         let (https, host, port, path) =
-            parse_http_url("https://api.github.com/repos/qianyiai/kurocat/releases/latest").unwrap();
+            parse_http_url("https://api.github.com/repos/keshuishiliu/kurocat/releases/latest").unwrap();
         assert!(https);
         assert_eq!(host, "api.github.com");
         assert_eq!(port, 443);
-        assert_eq!(path, "/repos/qianyiai/kurocat/releases/latest");
+        assert_eq!(path, "/repos/keshuishiliu/kurocat/releases/latest");
 
         let (https2, host2, port2, path2) =
             parse_http_url("http://127.0.0.1:8080/dl?v=1").unwrap();

@@ -443,6 +443,54 @@ where
     });
 }
 
+/// Strips an optional `:port` (and IPv6 brackets) from a `Host` header / URL authority.
+fn host_without_port(value: &str) -> &str {
+    let v = value.trim();
+    if let Some(rest) = v.strip_prefix('[') {
+        // IPv6 literal, e.g. `[::1]:27420`
+        return match rest.split_once(']') {
+            Some((inner, _)) => inner,
+            None => rest,
+        };
+    }
+    v.split(':').next().unwrap_or(v)
+}
+
+fn is_loopback_host_name(name: &str) -> bool {
+    let n = name.trim().trim_end_matches('.').to_ascii_lowercase();
+    n == "localhost" || n == "127.0.0.1" || n == "::1"
+}
+
+/// True when the `Host` header points at this machine's loopback interface.
+/// Defeats DNS rebinding: a hostile domain re-resolved to 127.0.0.1 still carries
+/// its own name in `Host`, so it is rejected here.
+fn is_loopback_host(host: &str) -> bool {
+    is_loopback_host_name(host_without_port(host))
+}
+
+/// True when a browser `Origin` header is a loopback page. `Origin: null`
+/// (file://, sandboxed iframes) is deliberately rejected.
+fn is_loopback_origin(origin: &str) -> bool {
+    let o = origin.trim();
+    if o.is_empty() || o.eq_ignore_ascii_case("null") {
+        return false;
+    }
+    let rest = match o.split_once("://") {
+        Some((scheme, rest))
+            if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") =>
+        {
+            rest
+        }
+        _ => return false,
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    // Reject userinfo smuggling such as `http://localhost@evil.example`
+    if authority.contains('@') {
+        return false;
+    }
+    is_loopback_host_name(host_without_port(authority))
+}
+
 fn write_http_response(stream: &mut TcpStream, status: &str, content_type: &str, body: &str) {
     let resp = format!(
         "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Accept, Mcp-Session-Id\r\nConnection: close\r\n\r\n{}",
@@ -474,6 +522,8 @@ fn handle_http_conn(mut stream: TcpStream, enabled: &AtomicBool, on_change: &dyn
     let path = parts[1];
 
     let mut content_length: usize = 0;
+    let mut host_header: Option<String> = None;
+    let mut origin_header: Option<String> = None;
     loop {
         let mut header = String::new();
         if reader.read_line(&mut header).is_err() {
@@ -486,7 +536,38 @@ fn handle_http_conn(mut stream: TcpStream, enabled: &AtomicBool, on_change: &dyn
         if let Some((k, v)) = trimmed.split_once(':') {
             if k.eq_ignore_ascii_case("content-length") {
                 content_length = v.trim().parse().unwrap_or(0);
+            } else if k.eq_ignore_ascii_case("host") {
+                host_header = Some(v.trim().to_string());
+            } else if k.eq_ignore_ascii_case("origin") {
+                origin_header = Some(v.trim().to_string());
             }
+        }
+    }
+
+    // SECURITY: this port is reachable by any web page the user visits, and the tools below
+    // can change persisted settings (including autostart). Require the Host header to name
+    // loopback (blocks DNS rebinding) and, when a browser sends Origin, require that to be
+    // loopback too. Native MCP clients (stdio/CLI/SDK) send no Origin and keep working.
+    if let Some(host) = host_header.as_deref() {
+        if !is_loopback_host(host) {
+            write_http_response(
+                &mut stream,
+                "403 Forbidden",
+                "application/json; charset=utf-8",
+                r#"{"error":"Non-loopback Host header rejected"}"#,
+            );
+            return;
+        }
+    }
+    if let Some(origin) = origin_header.as_deref() {
+        if !is_loopback_origin(origin) {
+            write_http_response(
+                &mut stream,
+                "403 Forbidden",
+                "application/json; charset=utf-8",
+                r#"{"error":"Cross-origin request rejected"}"#,
+            );
+            return;
         }
     }
 
@@ -573,4 +654,36 @@ fn handle_http_conn(mut stream: TcpStream, enabled: &AtomicBool, on_change: &dyn
         "application/json; charset=utf-8",
         r#"{"error":"Not found. Use POST /mcp or GET /health"}"#,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_loopback_hosts_only() {
+        assert!(is_loopback_host("127.0.0.1:27420"));
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("localhost:27420"));
+        assert!(is_loopback_host("LocalHost:27420"));
+        assert!(is_loopback_host("[::1]:27420"));
+        assert!(!is_loopback_host("evil.example:27420"));
+        assert!(!is_loopback_host("127.0.0.1.evil.example"));
+        assert!(!is_loopback_host("192.168.1.10:27420"));
+    }
+
+    #[test]
+    fn rejects_cross_site_origins() {
+        assert!(is_loopback_origin("http://127.0.0.1:6274"));
+        assert!(is_loopback_origin("http://localhost:6274"));
+        assert!(is_loopback_origin("https://localhost:3000/"));
+        // DNS rebinding: page is served from the attacker's own origin.
+        assert!(!is_loopback_origin("http://evil.example"));
+        assert!(!is_loopback_origin("https://attacker.test:8443"));
+        // file:// and sandboxed iframes.
+        assert!(!is_loopback_origin("null"));
+        // Userinfo smuggling.
+        assert!(!is_loopback_origin("http://localhost@evil.example"));
+        assert!(!is_loopback_origin("chrome-extension://abcdef"));
+    }
 }
