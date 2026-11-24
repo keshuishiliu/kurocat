@@ -7,6 +7,8 @@
 
 **当前版本 `v4.10.0`**（= 上游 v4.9.1 + 本仓库改动）。App 内「检查更新」与更新包地址校验已改为锚定本仓库 [keshuishiliu/kurocat](https://github.com/keshuishiliu/kurocat) Releases，不再跟随上游发布通道。
 
+**下载**：[Releases · v4.10.0](https://github.com/keshuishiliu/kurocat/releases/latest) —— Windows 安装包 / macOS Universal `dmg` / Linux `deb` + `AppImage`，由 GitHub Actions 三平台构建，安装包未签名。
+
 ## 目录
 
 1. [安全加固](#一安全加固)
@@ -204,9 +206,10 @@ cd src-tauri && cargo build
 | `npm run build` | ✅ 通过，产出 `dist/stats.html` |
 | 后端全部 SQL 实跑 | ✅ 用 sqlite3 逐条执行：DDL 幂等、四表 upsert 累加、六维查询、`LIKE 'events\_%' ESCAPE`、边界 `DELETE`、`DROP` + `incremental_vacuum` |
 | 界面三页布局 | ✅ 浏览器截图核对，修掉侧栏路径词中折断、趋势图末尾轴标签重叠 |
-| **Rust 侧编译** | ❌ **未验证**——开发机无 `cargo`，也未安装 MSVC C++ 工具链 |
+| **Rust 侧编译** | ✅ **GitHub Actions 三平台全通过**（Windows / macOS Universal / Linux amd64 + arm64），`cargo test` 单测通过 |
+| 产物 | ✅ Windows NSIS 安装包 2.54 MB、macOS Universal dmg 7.03 MB、Linux deb 2.90 MB + AppImage 77.98 MB |
 
-⚠️ 因此 Rust 部分虽已人工复核数轮（括号平衡、重复定义、`OpenFlags`、`cfg` 属性、`chrono` 依赖），但**首次 `cargo build` 仍可能有报错**。若失败请把输出贴回仓库 issue。
+开发机本身没装 Rust 工具链，编译与打包由 `.github/workflows/release.yml` 在推送 `v*` 标签时于 GitHub 托管机上完成，产物自动挂到 Release。本地想自己编，装 rustup + MSVC Build Tools 后执行上面的命令即可。
 
 ---
 
