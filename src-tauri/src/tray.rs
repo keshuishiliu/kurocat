@@ -43,6 +43,7 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
         };
         MenuItem::with_id(app, "restart_as_admin", label, !elevated, None::<&str>)?
     };
+    let open_stats = MenuItem::with_id(app, "open_stats", "输入统计…", true, None::<&str>)?;
     let click_through = CheckMenuItem::with_id(
         app,
         "click_through",
@@ -264,6 +265,7 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
         &[
             &toggle_show,
             &pause_guard,
+            &open_stats,
             &restart_as_admin,
             &sep1,
             &click_through,
@@ -293,6 +295,7 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
         &[
             &toggle_show,
             &pause_guard,
+            &open_stats,
             &sep1,
             &click_through,
             &privacy_guard,
@@ -321,6 +324,7 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
         &[
             &toggle_show,
             &pause_guard,
+            &open_stats,
             &sep1,
             &click_through,
             &privacy_guard,
@@ -418,6 +422,16 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
                         let _ = tray.set_tooltip(Some(tip));
                     }
                     set_pet_visible(app, !next);
+                }
+                "open_stats" => {
+                    // 菜单回调跑在主线程上，直接建窗口会把 WebView2 的 build 卡住
+                    // （同 open_stats_window 注释里的死锁），所以扔到 async runtime 里做。
+                    let handle = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(err) = crate::open_stats_window(handle).await {
+                            eprintln!("[tray] 打开输入统计失败: {err}");
+                        }
+                    });
                 }
                 #[cfg(windows)]
                 "restart_as_admin" => {

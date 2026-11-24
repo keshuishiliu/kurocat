@@ -121,6 +121,179 @@ pub fn normalize_tail_key_ids(raw: &[String]) -> Vec<String> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// 分类
+//
+// 分类不是原始记录，但它是「怎么解读这些记录」的唯一真相，所以跟设置一起放在
+// settings.json：换机器、备份数据目录时会跟着走，不会像 localStorage 那样
+// 清缓存就没了。前端只负责发起修改，校验与落盘都在这里做。
+// ---------------------------------------------------------------------------
+
+/// 「未分类」的内置 id。永远存在、不可删除、不能挂到别的分类下面。
+pub const UNCATEGORIZED_ID: &str = "uncat";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CategoryDef {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub icon: String,
+    #[serde(default)]
+    pub color: String,
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub builtin: bool,
+}
+
+fn cat(id: &str, name: &str, icon: &str, color: &str) -> CategoryDef {
+    CategoryDef {
+        id: id.to_string(),
+        name: name.to_string(),
+        icon: icon.to_string(),
+        color: color.to_string(),
+        parent_id: None,
+        builtin: false,
+    }
+}
+
+/// 首次启动的那一套分类。改这里等于改所有新用户的默认视图，
+/// 已经保存过 settings.json 的用户不受影响。
+pub fn default_categories() -> Vec<CategoryDef> {
+    let mut out = vec![
+        cat("game", "游戏", "🎮", "#f59e0b"),
+        cat("media", "媒体", "🎬", "#ef4444"),
+        cat("social", "社交", "💬", "#ec4899"),
+        cat("work", "工作", "💼", "#3b82f6"),
+        cat("creative", "创作", "🎨", "#9ca3af"),
+        cat("reference", "参考", "🌐", "#22c55e"),
+        cat("tools", "工具", "🛠️", "#8b5cf6"),
+    ];
+    let mut uncat = cat(UNCATEGORIZED_ID, "未分类", "📁", "#4b5563");
+    uncat.builtin = true;
+    out.push(uncat);
+    out
+}
+
+fn is_hex_color(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 7 && b[0] == b'#' && b[1..].iter().all(|c| c.is_ascii_hexdigit())
+}
+
+fn clean_id(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(40)
+        .collect()
+}
+
+/// 分类列表校验。前端也会校验一遍，但那只是「即时反馈」，
+/// 真正落盘的形状由这里决定：不接受空名、重复 id、悬空父级、环形父级。
+///
+/// 上限 200 个：足够细，又不至于让下拉框崩掉。
+pub fn normalize_categories(raw: &[CategoryDef]) -> Vec<CategoryDef> {
+    let mut out: Vec<CategoryDef> = Vec::with_capacity(raw.len().min(200));
+    for item in raw.iter().take(200) {
+        let id = clean_id(&item.id);
+        if id.is_empty() || out.iter().any(|c| c.id == id) {
+            continue;
+        }
+        let name: String = item.name.trim().chars().take(20).collect();
+        if name.is_empty() {
+            continue;
+        }
+        let icon: String = item.icon.trim().chars().take(8).collect();
+        out.push(CategoryDef {
+            id,
+            name,
+            icon: if icon.is_empty() {
+                "🏷️".to_string()
+            } else {
+                icon
+            },
+            color: if is_hex_color(item.color.trim()) {
+                item.color.trim().to_ascii_lowercase()
+            } else {
+                "#8b5cf6".to_string()
+            },
+            parent_id: item.parent_id.clone(),
+            builtin: item.builtin,
+        });
+    }
+
+    // 「未分类」必须存在：整张分类列表被删空时回退到默认那套，
+    // 否则统计页会出现「所有程序都没有分类」的空窗。
+    if !out.iter().any(|c| c.id == UNCATEGORIZED_ID) {
+        if out.is_empty() {
+            return default_categories();
+        }
+        let mut uncat = cat(UNCATEGORIZED_ID, "未分类", "📁", "#4b5563");
+        uncat.builtin = true;
+        out.push(uncat);
+    }
+
+    let ids: Vec<String> = out.iter().map(|c| c.id.clone()).collect();
+    for c in out.iter_mut() {
+        if c.id == UNCATEGORIZED_ID {
+            c.parent_id = None;
+            c.builtin = true;
+            continue;
+        }
+        let next = match c.parent_id.as_ref() {
+            // 悬空父级、认自己、认「未分类」当爹，都不成立
+            Some(p) if !ids.contains(p) || *p == c.id || *p == UNCATEGORIZED_ID => None,
+            Some(p) => Some(p.clone()),
+            None => None,
+        };
+        c.parent_id = next;
+    }
+
+    // 环形父级拍平。只允许两层，更深的结构在界面上也表达不出来。
+    let parent_of: std::collections::BTreeMap<String, Option<String>> = out
+        .iter()
+        .map(|c| (c.id.clone(), c.parent_id.clone()))
+        .collect();
+    let mut break_parents: Vec<String> = Vec::new();
+    for c in out.iter() {
+        let Some(parent_id) = c.parent_id.as_ref() else {
+            continue;
+        };
+        if let Some(Some(grand)) = parent_of.get(parent_id) {
+            if *grand == c.id {
+                // 互相认爹 → 把父级提到顶层，自己留在原位
+                break_parents.push(parent_id.clone());
+            }
+        }
+    }
+    for c in out.iter_mut() {
+        if break_parents.iter().any(|p| *p == c.id) {
+            c.parent_id = None;
+        }
+    }
+    out
+}
+
+/// 应用 → 分类。丢掉指向不存在分类的条目，避免删完分类还留一堆幽灵映射。
+pub fn normalize_app_categories(
+    raw: &std::collections::BTreeMap<String, String>,
+    categories: &[CategoryDef],
+) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for (app, cid) in raw.iter().take(4000) {
+        let key: String = app.trim().chars().take(120).collect();
+        if key.is_empty() {
+            continue;
+        }
+        if !categories.iter().any(|c| c.id == *cid) {
+            continue;
+        }
+        out.insert(key, cid.chars().take(40).collect());
+    }
+    out
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -169,6 +342,14 @@ pub struct AppSettings {
     pub input_log_retention_days: u32,
     #[serde(default)]
     pub input_log_paused: bool,
+    /// 鼠标轨迹采样。默认关闭；关闭时不落盘，开启后才建 trail.db。
+    #[serde(default)]
+    pub input_log_trail_recording: bool,
+    // ---- 分类（只由统计窗口的 categories_save 写入） ----
+    #[serde(default = "default_categories")]
+    pub categories: Vec<CategoryDef>,
+    #[serde(default)]
+    pub app_categories: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for AppSettings {
@@ -201,6 +382,9 @@ impl Default for AppSettings {
             input_log_active_gap_minutes: default_input_log_active_gap(),
             input_log_retention_days: 0,
             input_log_paused: false,
+            input_log_trail_recording: false,
+            categories: default_categories(),
+            app_categories: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -385,6 +569,8 @@ pub fn load_settings() -> AppSettings {
                 normalize_input_log_active_gap(parsed.input_log_active_gap_minutes);
             parsed.input_log_retention_days =
                 normalize_input_log_retention(parsed.input_log_retention_days);
+            parsed.categories = normalize_categories(&parsed.categories);
+            parsed.app_categories = normalize_app_categories(&parsed.app_categories, &parsed.categories);
             return parsed;
         }
     }
@@ -689,5 +875,80 @@ mod tests {
         let parsed: AppSettings = serde_json::from_str(legacy).expect("legacy json should parse");
         assert_eq!(parsed.tail_key_mode, "smart");
         assert_eq!(parsed.tail_key_ids, default_tail_key_ids());
+        // 老配置里没有分类字段，必须补上一整套默认分类，而不是空白列表
+        assert_eq!(parsed.categories.len(), 8);
+        assert!(parsed.app_categories.is_empty());
+    }
+
+    /// 前端可以传任何东西上来，落盘前必须被收拾成可用的形状。
+    #[test]
+    fn categories_are_sanitized_before_saving() {
+        let raw = vec![
+            CategoryDef {
+                id: "game".into(),
+                name: "  游戏  ".into(),
+                icon: "".into(),
+                color: "#F59E0B".into(),
+                parent_id: Some("ghost".into()),
+                builtin: false,
+            },
+            // 与上面 id 重复 → 丢弃，保留先来的那个
+            CategoryDef {
+                id: "game".into(),
+                name: "重复".into(),
+                icon: "🎮".into(),
+                color: "#ffffff".into(),
+                parent_id: None,
+                builtin: false,
+            },
+            // 空名 → 丢弃
+            CategoryDef {
+                id: "blank".into(),
+                name: "   ".into(),
+                icon: "x".into(),
+                color: "#ffffff".into(),
+                parent_id: None,
+                builtin: false,
+            },
+            CategoryDef {
+                id: "badcol".into(),
+                name: "坏颜色".into(),
+                icon: "🎨".into(),
+                color: "red".into(),
+                parent_id: None,
+                builtin: false,
+            },
+            // 自己当自己的父级 → 拍平成顶层
+            CategoryDef {
+                id: "selfy".into(),
+                name: "自环".into(),
+                icon: "🔁".into(),
+                color: "#123456".into(),
+                parent_id: Some("selfy".into()),
+                builtin: false,
+            },
+        ];
+        let out = normalize_categories(&raw);
+        let ids: Vec<&str> = out.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["game", "badcol", "selfy", UNCATEGORIZED_ID]);
+        assert_eq!(out[0].name, "游戏");
+        assert_eq!(out[0].icon, "🏷️");
+        assert_eq!(out[0].color, "#f59e0b");
+        assert_eq!(out[0].parent_id, None, "悬空父级要断开");
+        assert_eq!(out[1].color, "#8b5cf6");
+        assert_eq!(out[2].parent_id, None);
+        assert!(out[3].builtin, "未分类必须自动补上且标记为内置");
+    }
+
+    #[test]
+    fn app_categories_drop_dangling_references() {
+        let cats = normalize_categories(&default_categories());
+        let mut raw = std::collections::BTreeMap::new();
+        raw.insert("chrome.exe".to_string(), "work".to_string());
+        raw.insert("ghost.exe".to_string(), "no-such-cat".to_string());
+        raw.insert("   ".to_string(), "game".to_string());
+        let out = normalize_app_categories(&raw, &cats);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.get("chrome.exe").map(String::as_str), Some("work"));
     }
 }

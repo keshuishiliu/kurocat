@@ -4,7 +4,18 @@
  * 而且手写后颜色与线宽可以完全按 KuroCat 的配色走。
  */
 
-const C = {
+interface Palette {
+  accent: string;
+  accentDim: string;
+  accentFaint: string;
+  accent2: string;
+  grid: string;
+  axis: string;
+  label: string;
+  track: string;
+}
+
+const DARK: Palette = {
   accent: '#7ea6ff',
   accentDim: 'rgba(126, 166, 255, 0.30)',
   accentFaint: 'rgba(126, 166, 255, 0.10)',
@@ -12,7 +23,49 @@ const C = {
   grid: 'rgba(255, 255, 255, 0.07)',
   axis: '#7c818d',
   label: '#8b909c',
+  track: 'rgba(255, 255, 255, 0.035)',
 };
+
+const LIGHT: Palette = {
+  accent: '#3b6ef0',
+  accentDim: 'rgba(59, 110, 240, 0.32)',
+  accentFaint: 'rgba(59, 110, 240, 0.12)',
+  accent2: '#0f9d78',
+  grid: 'rgba(16, 24, 40, 0.08)',
+  axis: '#98a0ad',
+  label: '#6b7280',
+  track: 'rgba(16, 24, 40, 0.06)',
+};
+
+/** 图表不读 CSS 变量（SVG 里 var() 在旧 WebView 上不可靠），换主题时由调用方显式切换。 */
+let C: Palette = DARK;
+
+export function setChartTheme(theme: 'dark' | 'light'): void {
+  C = theme === 'light' ? LIGHT : DARK;
+}
+
+/** 图内文字统一字号。viewBox 宽度取容器真实像素宽，所以这 11px 就是屏幕上的 11px。 */
+const FONT = 11;
+/** 容器窄到这个程度就不画了，留空态；也避免 clientWidth 取到 0 时算出退化比例。 */
+const MIN_W = 200;
+const FALLBACK_W = 620;
+
+/**
+ * 取容器真实像素宽当 viewBox 宽度。
+ * 关键点：CSS 是 width:100%，如果 viewBox 还写死 620，整张图（含文字）会被等比压缩——
+ * 半宽卡片里 334/620 = 0.54，9px 的字实际只画出来 4.9px。1 单位 = 1 像素才对。
+ */
+function measure(host: HTMLElement): number {
+  const w = host.clientWidth;
+  return w >= MIN_W ? Math.round(w) : FALLBACK_W;
+}
+
+/** 记住每个图表的最后一次渲染，窗口改尺寸时原地重画，不用重新查库。 */
+const replayers = new Map<HTMLElement, () => void>();
+
+export function redrawAllCharts(): void {
+  replayers.forEach((fn) => fn());
+}
 
 export interface Point {
   label: string;
@@ -76,24 +129,24 @@ export function renderBars(
   data: Point[],
   opts: { height?: number; maxLabels?: number } = {},
 ): void {
+  replayers.set(host, () => renderBars(host, data, opts));
   const rows = data.filter((d) => Number.isFinite(d.value));
   if (!rows.length) {
     empty(host);
     return;
   }
-  const W = 620;
+  const W = measure(host);
   const H = opts.height ?? 168;
-  const padL = 44;
+  const padL = 48;
   const padR = 10;
   const padT = 12;
-  const padB = 22;
+  const padB = 24;
   const iw = W - padL - padR;
   const ih = H - padT - padB;
   const max = Math.max(1, ...rows.map((d) => d.value));
   const slot = iw / rows.length;
-  const barW = Math.max(1.5, Math.min(26, slot * 0.62));
-  const maxLabels = opts.maxLabels ?? 8;
-  const labelStep = Math.max(1, Math.ceil(rows.length / maxLabels));
+  const barW = Math.max(2, Math.min(26, slot * 0.62));
+  const labelStep = stepFor(rows, slot, opts.maxLabels ?? 8);
 
   const parts: string[] = [];
   parts.push(`<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img">`);
@@ -106,7 +159,7 @@ export function renderBars(
       `<line x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}" stroke="${C.grid}" stroke-width="1"/>`,
     );
     parts.push(
-      `<text x="${padL - 6}" y="${(y + 3).toFixed(1)}" fill="${C.axis}" font-size="9" text-anchor="end">${esc(fmtNum(val))}</text>`,
+      `<text x="${padL - 7}" y="${(y + 4).toFixed(1)}" fill="${C.axis}" font-size="${FONT}" text-anchor="end">${esc(fmtNum(val))}</text>`,
     );
   }
 
@@ -130,12 +183,26 @@ export function renderBars(
     if (!isEdge && (i % labelStep !== 0 || last - i < labelStep)) return;
     const x = padL + slot * i + slot / 2;
     parts.push(
-      `<text x="${x.toFixed(1)}" y="${H - 6}" fill="${C.label}" font-size="9" text-anchor="middle">${esc(d.label)}</text>`,
+      `<text x="${x.toFixed(1)}" y="${H - 7}" fill="${C.label}" font-size="${FONT}" text-anchor="middle">${esc(d.label)}</text>`,
     );
   });
 
   parts.push('</svg>');
   host.innerHTML = parts.join('');
+}
+
+/**
+ * x 轴标签抽稀步长。
+ *
+ * 只按「行数 / maxLabels」算的话，窄卡片里标签必然糊成一片——24 个小时桶挤在 334px 里，
+ * 每格只有 13px，却还想画 12 个标签。所以同时按像素兜底：先估算一个标签要占多宽，
+ * 再取「像素需要的步长」和「数量上限」里更保守的那个。
+ */
+function stepFor(rows: Point[], slot: number, maxLabels: number): number {
+  const longest = rows.reduce((m, d) => Math.max(m, d.label.length), 0);
+  const minLabelPx = longest * FONT * 0.62 + 6;
+  const byWidth = Math.ceil(minLabelPx / Math.max(1, slot));
+  return Math.max(1, byWidth, Math.ceil(rows.length / Math.max(1, maxLabels)));
 }
 
 /** 折线 + 面积填充。适合看长区间趋势形态。 */
@@ -144,24 +211,24 @@ export function renderLine(
   data: Point[],
   opts: { height?: number; maxLabels?: number } = {},
 ): void {
+  replayers.set(host, () => renderLine(host, data, opts));
   const rows = data.filter((d) => Number.isFinite(d.value));
   if (rows.length < 2) {
     renderBars(host, rows, opts);
     return;
   }
-  const W = 620;
+  const W = measure(host);
   const H = opts.height ?? 190;
-  const padL = 44;
+  const padL = 48;
   const padR = 12;
   const padT = 14;
-  const padB = 22;
+  const padB = 24;
   const iw = W - padL - padR;
   const ih = H - padT - padB;
   const max = Math.max(1, ...rows.map((d) => d.value));
   const stepX = iw / (rows.length - 1);
   const yOf = (v: number) => padT + ih - (v / max) * ih;
-  const maxLabels = opts.maxLabels ?? 8;
-  const labelStep = Math.max(1, Math.ceil(rows.length / maxLabels));
+  const labelStep = stepFor(rows, stepX, opts.maxLabels ?? 8);
 
   const pts = rows.map((d, i) => `${(padL + stepX * i).toFixed(1)},${yOf(d.value).toFixed(1)}`);
   const area = `M ${padL},${padT + ih} L ${pts.join(' L ')} L ${(padL + iw).toFixed(1)},${padT + ih} Z`;
@@ -179,7 +246,7 @@ export function renderLine(
       `<line x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}" stroke="${C.grid}" stroke-width="1"/>`,
     );
     parts.push(
-      `<text x="${padL - 6}" y="${(y + 3).toFixed(1)}" fill="${C.axis}" font-size="9" text-anchor="end">${esc(fmtNum(val))}</text>`,
+      `<text x="${padL - 7}" y="${(y + 4).toFixed(1)}" fill="${C.axis}" font-size="${FONT}" text-anchor="end">${esc(fmtNum(val))}</text>`,
     );
   }
 
@@ -194,7 +261,7 @@ export function renderLine(
     // 距末尾不足一个 step 时不再打标签，否则会和最后一个标签挤在一起
     if (!isEdge && (i % labelStep !== 0 || last - i < labelStep)) return;
     parts.push(
-      `<text x="${(padL + stepX * i).toFixed(1)}" y="${H - 6}" fill="${C.label}" font-size="9" text-anchor="middle">${esc(d.label)}</text>`,
+      `<text x="${(padL + stepX * i).toFixed(1)}" y="${H - 7}" fill="${C.label}" font-size="${FONT}" text-anchor="middle">${esc(d.label)}</text>`,
     );
   });
 
@@ -202,43 +269,50 @@ export function renderLine(
   host.innerHTML = parts.join('');
 }
 
-/** 横向条。适合按程序 / 按键排行。 */
+/** 横向条。适合按程序 / 按键排行。`colors` 可按行着色（按分类统计时用分类色）。 */
 export function renderHBars(
   host: HTMLElement,
   data: Point[],
-  opts: { labelWidth?: number; rowHeight?: number } = {},
+  opts: { labelWidth?: number; rowHeight?: number; colors?: string[] } = {},
 ): void {
+  replayers.set(host, () => renderHBars(host, data, opts));
   const rows = data.filter((d) => Number.isFinite(d.value) && d.value > 0);
   if (!rows.length) {
     empty(host);
     return;
   }
-  const W = 620;
-  const rowH = opts.rowHeight ?? 22;
-  const labelW = opts.labelWidth ?? 130;
-  const valueW = 62;
-  const H = rows.length * rowH + 6;
-  const barMax = W - labelW - valueW - 10;
+  const W = measure(host);
+  const rowH = opts.rowHeight ?? 26;
+  const barH = Math.min(12, rowH - 10);
+  const valueW = 56;
+  // 标签区最多吃掉 48% 宽度，剩下的留给条本身，否则窄卡片里条会只剩一小截
+  const labelW = Math.max(72, Math.min(opts.labelWidth ?? 130, Math.round(W * 0.48)));
+  const H = rows.length * rowH + 8;
+  const barMax = Math.max(40, W - labelW - valueW - 10);
   const max = Math.max(1, ...rows.map((d) => d.value));
+  const maxChars = Math.max(6, Math.floor(labelW / (FONT * 0.8)));
 
   const parts: string[] = [];
   parts.push(`<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img">`);
 
   rows.forEach((d, i) => {
-    const y = 3 + i * rowH;
-    const barH = Math.min(12, rowH - 8);
-    const w = Math.max(1.5, (d.value / max) * barMax);
+    const y = 4 + i * rowH;
+    // 文字与条在行内垂直居中，11px 的基线偏移约 4px
+    const barY = y + (rowH - barH) / 2;
+    const ty = barY + barH / 2 + 4;
+    const w = Math.max(2, (d.value / max) * barMax);
+    const color = opts.colors?.[i] ?? (i === 0 ? C.accent : C.accentDim);
     parts.push(
-      `<text x="0" y="${(y + barH - 1).toFixed(1)}" fill="${C.label}" font-size="10">${esc(clip(d.label, 20))}</text>`,
+      `<text x="0" y="${ty.toFixed(1)}" fill="${C.label}" font-size="${FONT}">${esc(clip(d.label, maxChars))}</text>`,
     );
     parts.push(
-      `<rect x="${labelW}" y="${y.toFixed(1)}" width="${barMax}" height="${barH}" rx="3" fill="rgba(255,255,255,0.035)"/>`,
+      `<rect x="${labelW}" y="${barY.toFixed(1)}" width="${barMax}" height="${barH}" rx="3" fill="${C.track}"/>`,
     );
     parts.push(
-      `<rect x="${labelW}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${barH}" rx="3" fill="${i === 0 ? C.accent : C.accentDim}"/>`,
+      `<rect x="${labelW}" y="${barY.toFixed(1)}" width="${w.toFixed(1)}" height="${barH}" rx="3" fill="${color}"/>`,
     );
     parts.push(
-      `<text x="${W}" y="${(y + barH - 1).toFixed(1)}" fill="${C.label}" font-size="10" text-anchor="end">${esc(fmtNum(d.value))}</text>`,
+      `<text x="${W}" y="${ty.toFixed(1)}" fill="${C.label}" font-size="${FONT}" text-anchor="end">${esc(fmtNum(d.value))}</text>`,
     );
   });
 

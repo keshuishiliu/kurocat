@@ -1,20 +1,72 @@
-/* KuroCat 输入统计窗口 —— 独立样式表，不参与主窗口/菜单窗口的布局计算 */
+/* KuroCat 输入统计窗口 —— 独立样式表，不参与主窗口/菜单窗口的布局计算
+ *
+ * 配色全部走 CSS 变量，`html[data-theme="light"]` 一套覆盖即可换肤。
+ * 新增颜色时请先加变量，不要写死色值，否则浅色主题下会出现「黑底黑字」。
+ */
 
 :root {
   --bg: #14161b;
+  --side: #101217;
   --panel: #1a1d24;
   --panel-2: #20242c;
   --line: rgba(255, 255, 255, 0.08);
   --line-strong: rgba(255, 255, 255, 0.16);
+  --row-line: rgba(255, 255, 255, 0.045);
+  --hover: rgba(255, 255, 255, 0.04);
+  --subtle: rgba(255, 255, 255, 0.03);
+  --chart-track: rgba(255, 255, 255, 0.035);
   --text: #e8eaef;
   --muted: #8b909c;
+  --faint: #6b707c;
   --accent: #7ea6ff;
   --accent-soft: rgba(126, 166, 255, 0.14);
+  --on-accent: #0d1017;
   --good: #6ee7c8;
   --warn: #f5b544;
   --danger: #ff6b6b;
   --danger-soft: rgba(255, 107, 107, 0.12);
+  --toast-bg: #262b34;
+  --switch-off: #2c313b;
+  --switch-knob: #8b909c;
+  --mask: rgba(6, 7, 10, 0.72);
+  --scroll: rgba(255, 255, 255, 0.1);
+  --trail-bg: #0f1117;
+  --trail-grid: rgba(255, 255, 255, 0.05);
+  --trail-route: rgba(126, 166, 255, 0.16);
   --radius: 12px;
+  color-scheme: dark;
+}
+
+html[data-theme="light"] {
+  --bg: #f4f5f8;
+  --side: #ffffff;
+  --panel: #ffffff;
+  --panel-2: #f2f4f8;
+  --line: rgba(16, 24, 40, 0.08);
+  --line-strong: rgba(16, 24, 40, 0.16);
+  --row-line: rgba(16, 24, 40, 0.06);
+  --hover: rgba(16, 24, 40, 0.045);
+  --subtle: rgba(16, 24, 40, 0.035);
+  --chart-track: rgba(16, 24, 40, 0.06);
+  --text: #1b1f27;
+  --muted: #6b7280;
+  --faint: #8b929e;
+  --accent: #3b6ef0;
+  --accent-soft: rgba(59, 110, 240, 0.11);
+  --on-accent: #ffffff;
+  --good: #0f9d78;
+  --warn: #b7791f;
+  --danger: #d92d2d;
+  --danger-soft: rgba(217, 45, 45, 0.08);
+  --toast-bg: #ffffff;
+  --switch-off: #d8dce4;
+  --switch-knob: #ffffff;
+  --mask: rgba(16, 24, 40, 0.36);
+  --scroll: rgba(16, 24, 40, 0.16);
+  --trail-bg: #ffffff;
+  --trail-grid: rgba(16, 24, 40, 0.06);
+  --trail-route: rgba(59, 110, 240, 0.16);
+  color-scheme: light;
 }
 
 * {
@@ -48,7 +100,7 @@ body {
   flex-direction: column;
   gap: 18px;
   padding: 20px 14px;
-  background: #101217;
+  background: var(--side);
   border-right: 1px solid var(--line);
 }
 
@@ -112,7 +164,7 @@ body {
 }
 
 .nav-item:hover {
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--hover);
   color: var(--text);
 }
 
@@ -126,7 +178,7 @@ body {
   margin-top: auto;
   font-size: 11px;
   line-height: 1.6;
-  color: #6b707c;
+  color: var(--faint);
   padding: 0 6px;
   word-break: break-all;
 }
@@ -143,7 +195,7 @@ body {
 }
 
 .main::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.1);
+  background: var(--scroll);
   border-radius: 6px;
   border: 3px solid var(--bg);
 }
@@ -226,7 +278,7 @@ body {
 
 .metric-hint {
   font-size: 11px;
-  color: #6b707c;
+  color: var(--faint);
   margin-top: 6px;
 }
 
@@ -275,7 +327,7 @@ body {
 }
 
 .pill.off {
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--subtle);
   color: var(--muted);
 }
 
@@ -330,7 +382,7 @@ body {
 }
 
 .chart-empty {
-  color: #5f646f;
+  color: var(--faint);
   font-size: 12px;
   padding: 40px 0;
   text-align: center;
@@ -360,18 +412,19 @@ body {
 
 .chip:hover {
   color: var(--text);
-  border-color: rgba(255, 255, 255, 0.28);
+  border-color: var(--line-strong);
+  background: var(--hover);
 }
 
 .chip.active {
   background: var(--accent);
   border-color: var(--accent);
-  color: #0d1017;
+  color: var(--on-accent);
   font-weight: 600;
 }
 
 .chip.danger {
-  border-color: rgba(255, 107, 107, 0.4);
+  border-color: rgba(217, 45, 45, 0.4);
   color: var(--danger);
 }
 
@@ -418,7 +471,7 @@ body {
   justify-content: space-between;
   gap: 16px;
   padding: 13px 0;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.045);
+  border-bottom: 1px solid var(--row-line);
 }
 
 .row:last-child {
@@ -438,6 +491,11 @@ body {
   font-size: 11px;
   color: var(--muted);
   line-height: 1.55;
+}
+
+.row-desc strong {
+  color: var(--text);
+  font-weight: 600;
 }
 
 .row-ctl {
@@ -469,7 +527,7 @@ body {
   position: absolute;
   inset: 0;
   border-radius: 20px;
-  background: #2c313b;
+  background: var(--switch-off);
   transition: background 0.18s ease;
   pointer-events: none;
 }
@@ -482,12 +540,17 @@ body {
   width: 16px;
   height: 16px;
   border-radius: 50%;
-  background: #8b909c;
+  background: var(--switch-knob);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
   transition: transform 0.18s ease, background 0.18s ease;
 }
 
 .switch input:checked + .switch-track {
   background: rgba(126, 166, 255, 0.35);
+}
+
+html[data-theme="light"] .switch input:checked + .switch-track {
+  background: rgba(59, 110, 240, 0.4);
 }
 
 .switch input:checked + .switch-track::after {
@@ -500,24 +563,11 @@ body {
   cursor: not-allowed;
 }
 
-select {
+select,
+input[type="text"],
+input[type="number"],
+input[type="datetime-local"] {
   appearance: none;
-  background: var(--panel-2);
-  border: 1px solid var(--line-strong);
-  color: var(--text);
-  font-family: inherit;
-  font-size: 12px;
-  padding: 6px 26px 6px 10px;
-  border-radius: 7px;
-  cursor: pointer;
-  background-image: linear-gradient(45deg, transparent 50%, #8b909c 50%),
-    linear-gradient(135deg, #8b909c 50%, transparent 50%);
-  background-position: calc(100% - 13px) 50%, calc(100% - 8px) 50%;
-  background-size: 5px 5px, 5px 5px;
-  background-repeat: no-repeat;
-}
-
-input[type="number"] {
   background: var(--panel-2);
   border: 1px solid var(--line-strong);
   color: var(--text);
@@ -525,18 +575,49 @@ input[type="number"] {
   font-size: 12px;
   padding: 6px 10px;
   border-radius: 7px;
+}
+
+select {
+  padding-right: 26px;
+  cursor: pointer;
+  background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+    linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position: calc(100% - 13px) 50%, calc(100% - 8px) 50%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+}
+
+input[type="number"] {
   width: 86px;
 }
 
-input[type="number"]:focus,
+input[type="text"] {
+  width: 150px;
+}
+
+input[type="datetime-local"] {
+  width: 190px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11.5px;
+}
+
+input:focus,
 select:focus {
   outline: 1px solid var(--accent);
   outline-offset: 0;
 }
 
+.field-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
 /* 危险区 */
 .danger-zone {
-  border-color: rgba(255, 107, 107, 0.24);
+  border-color: rgba(217, 45, 45, 0.24);
 }
 
 .danger-zone .settings-card-title {
@@ -547,7 +628,7 @@ select:focus {
   font-size: 11px;
   line-height: 1.7;
   color: var(--muted);
-  background: rgba(255, 255, 255, 0.03);
+  background: var(--subtle);
   border-left: 2px solid var(--line-strong);
   border-radius: 0 6px 6px 0;
   padding: 10px 12px;
@@ -559,12 +640,263 @@ select:focus {
   font-weight: 600;
 }
 
+/* ---------------- 分类 ---------------- */
+
+.cat-list {
+  padding: 4px 0;
+}
+
+.cat-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border-radius: 9px;
+  min-height: 44px;
+}
+
+.cat-row:hover {
+  background: var(--hover);
+}
+
+.cat-row.active {
+  background: var(--accent-soft);
+}
+
+.cat-row.child {
+  padding-left: 34px;
+}
+
+.cat-icon {
+  width: 22px;
+  text-align: center;
+  font-size: 16px;
+  line-height: 1;
+  flex: 0 0 auto;
+}
+
+.cat-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  box-shadow: 0 0 0 3px var(--subtle);
+}
+
+.cat-name {
+  font-size: 13px;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cat-count {
+  font-size: 11px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+  margin-right: 4px;
+}
+
+.cat-ops {
+  display: flex;
+  gap: 4px;
+  /* 常驻显示但压低存在感：纯 hover 才出现的话，很多人根本不知道能编辑 */
+  opacity: 0.72;
+  transition: opacity 0.15s ease;
+}
+
+.cat-row:hover .cat-ops {
+  opacity: 1;
+}
+
+.cat-op {
+  appearance: none;
+  border: 1px solid var(--line-strong);
+  background: transparent;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 11px;
+  padding: 3px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.cat-op:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+
+.cat-op.danger:hover {
+  color: var(--danger);
+  border-color: rgba(217, 45, 45, 0.4);
+}
+
+.app-cat-list {
+  max-height: 360px;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+.app-cat-list::-webkit-scrollbar {
+  width: 8px;
+}
+
+.app-cat-list::-webkit-scrollbar-thumb {
+  background: var(--scroll);
+  border-radius: 5px;
+}
+
+.app-cat-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--row-line);
+}
+
+.app-cat-row:last-child {
+  border-bottom: 0;
+}
+
+.app-cat-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-cat-meta {
+  font-size: 11px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+  flex: 0 0 auto;
+}
+
+.app-cat-row select {
+  width: 140px;
+  flex: 0 0 auto;
+}
+
+/* ---------------- 轨迹 ---------------- */
+
+.trail-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.trail-range {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.trail-bar .range-row {
+  margin-bottom: 0;
+}
+
+.trail-stage {
+  position: relative;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+  height: 420px;
+  margin-bottom: 12px;
+}
+
+#trail-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.trail-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: transparent;
+  pointer-events: none;
+  text-align: center;
+  padding: 20px;
+}
+
+.trail-overlay[hidden] {
+  display: none;
+}
+
+.trail-overlay-title {
+  font-size: 13px;
+  color: var(--text);
+}
+
+.trail-overlay-desc {
+  font-size: 11px;
+  color: var(--muted);
+  max-width: 420px;
+  line-height: 1.6;
+}
+
+.trail-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  flex-wrap: wrap;
+}
+
+.trail-clock {
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  min-width: 138px;
+}
+
+input[type="range"] {
+  appearance: none;
+  flex: 1 1 180px;
+  height: 4px;
+  border-radius: 4px;
+  background: var(--line-strong);
+  cursor: pointer;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--panel);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+input[type="range"]:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 /* ---------------- 弹窗 ---------------- */
 
 .modal-mask {
   position: fixed;
   inset: 0;
-  background: rgba(6, 7, 10, 0.72);
+  background: var(--mask);
   display: none;
   align-items: center;
   justify-content: center;
@@ -583,7 +915,13 @@ select:focus {
   width: 100%;
   max-width: 460px;
   padding: 22px 24px;
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
+  max-height: 88vh;
+  overflow-y: auto;
+}
+
+.modal.modal-cat {
+  max-width: 560px;
 }
 
 .modal h3 {
@@ -596,7 +934,15 @@ select:focus {
 .modal li {
   font-size: 12px;
   line-height: 1.75;
-  color: #b9bec9;
+  color: var(--muted);
+}
+
+.modal code {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  background: var(--subtle);
+  padding: 1px 5px;
+  border-radius: 4px;
 }
 
 .modal ul {
@@ -616,6 +962,80 @@ select:focus {
   margin-top: 20px;
 }
 
+/* 分类表单 */
+.cat-form {
+  display: grid;
+  grid-template-columns: 96px 1fr;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.field-label {
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.cat-form-right .field-label:not(:first-child) {
+  margin-top: 12px;
+}
+
+.icon-drop {
+  width: 96px;
+  height: 96px;
+  border-radius: 12px;
+  border: 1px dashed var(--line-strong);
+  background: var(--panel-2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.icon-drop input {
+  border: 0;
+  background: transparent;
+  width: 100%;
+  height: 100%;
+  text-align: center;
+  font-size: 32px;
+  line-height: 1;
+  padding: 0;
+  color: var(--text);
+}
+
+.icon-drop input:focus {
+  outline: none;
+}
+
+.cat-form-right input[type="text"] {
+  width: 100%;
+}
+
+.color-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.color-row input[type="color"] {
+  width: 38px;
+  height: 30px;
+  padding: 2px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--panel-2);
+  cursor: pointer;
+}
+
+.color-row input[type="text"] {
+  flex: 1 1 auto;
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+
+#cat-parent {
+  width: 100%;
+}
+
 .btn {
   appearance: none;
   border: 1px solid var(--line-strong);
@@ -630,13 +1050,18 @@ select:focus {
 }
 
 .btn:hover {
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--hover);
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .btn.primary {
   background: var(--accent);
   border-color: var(--accent);
-  color: #0d1017;
+  color: var(--on-accent);
   font-weight: 600;
 }
 
@@ -647,7 +1072,7 @@ select:focus {
 .btn.danger {
   background: var(--danger);
   border-color: var(--danger);
-  color: #1a0c0c;
+  color: #fff;
   font-weight: 600;
 }
 
@@ -657,7 +1082,7 @@ select:focus {
   left: 50%;
   bottom: 26px;
   transform: translateX(-50%) translateY(12px);
-  background: #262b34;
+  background: var(--toast-bg);
   border: 1px solid var(--line-strong);
   color: var(--text);
   font-size: 12px;
@@ -668,6 +1093,7 @@ select:focus {
   transition: opacity 0.2s ease, transform 0.2s ease;
   z-index: 60;
   max-width: 70vw;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18);
 }
 
 .toast.show {

@@ -626,6 +626,11 @@ pub fn start_global_hooks(app: AppHandle) {
                         // 先更新坐标缓存（每条移动都更新，不受下面 62Hz 限流影响），
                         // 再决定要不要发给前端。
                         last_cursor = Some((x, y));
+                        // 轨迹采样：内部自己节流到 10Hz，且默认关闭时立即返回，
+                        // 所以这里可以无条件调用，不额外判断。密码框激活期间整段不采。
+                        if !PASSWORD_PRIVACY_ACTIVE.load(Ordering::Relaxed) {
+                            crate::trail::push(x, y);
+                        }
                         let now = Instant::now();
                         if now.duration_since(last_mouse_emit) >= Duration::from_millis(16) {
                             last_mouse_emit = now;

@@ -880,9 +880,17 @@ pub struct LogStatus {
     pub app_count: i64,
     pub retention_days: u32,
     pub active_gap_minutes: u32,
+    /// 用户是否开启了轨迹采样（不是「此刻在采」，暂停时它是 true）。
+    pub trail_enabled: bool,
 }
 
-pub fn status(enabled: bool, paused: bool, retention_days: u32, gap_minutes: u32) -> LogStatus {
+pub fn status(
+    enabled: bool,
+    paused: bool,
+    retention_days: u32,
+    gap_minutes: u32,
+    trail_enabled: bool,
+) -> LogStatus {
     let mut st = LogStatus {
         enabled,
         paused,
@@ -899,6 +907,7 @@ pub fn status(enabled: bool, paused: bool, retention_days: u32, gap_minutes: u32
         app_count: 0,
         retention_days,
         active_gap_minutes: gap_minutes,
+        trail_enabled,
     };
 
     let today = day_hour_local(now_ms()).0;

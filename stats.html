@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -17,6 +17,7 @@
         <nav class="nav">
           <button class="nav-item active" data-page="dashboard" type="button">仪表盘</button>
           <button class="nav-item" data-page="stats" type="button">统计</button>
+          <button class="nav-item" data-page="trail" type="button">轨迹</button>
           <button class="nav-item" data-page="settings" type="button">设置</button>
         </nav>
 
@@ -110,20 +111,91 @@
               <div class="chart-body" id="chart-trend"><div class="chart-empty">加载中…</div></div>
             </div>
 
-            <div class="chart-card">
+            <div class="chart-card wide">
               <div class="chart-title"><span>一天里的击键分布</span><b id="hour-sum">—</b></div>
               <div class="chart-body" id="chart-hour"><div class="chart-empty">加载中…</div></div>
             </div>
 
-            <div class="chart-card">
+            <div class="chart-card wide">
               <div class="chart-title"><span>按程序（击键数）</span><b id="app-sum">—</b></div>
               <div class="chart-body" id="chart-app"><div class="chart-empty">加载中…</div></div>
             </div>
 
-            <div class="chart-card wide">
+            <div class="chart-card">
+              <div class="chart-title"><span>按分类（击键数）</span><b id="cat-sum">—</b></div>
+              <div class="chart-body" id="chart-cat"><div class="chart-empty">加载中…</div></div>
+            </div>
+
+            <div class="chart-card">
               <div class="chart-title"><span>最常按的键</span><b id="key-sum">—</b></div>
               <div class="chart-body" id="chart-key"><div class="chart-empty">加载中…</div></div>
             </div>
+          </div>
+
+          <div class="note" id="stats-cat-note" hidden></div>
+        </section>
+
+        <!-- ============ 轨迹 ============ -->
+        <section class="page" id="page-trail">
+          <div class="page-head">
+            <h1 class="page-title">鼠标轨迹</h1>
+            <span class="page-sub" id="trail-sub">只记录坐标与时间，不记录任何画面内容</span>
+          </div>
+
+          <div class="trail-bar">
+            <div class="trail-range">
+              <label class="field-inline">
+                <span>从</span>
+                <input type="datetime-local" id="trail-from" />
+              </label>
+              <label class="field-inline">
+                <span>到</span>
+                <input type="datetime-local" id="trail-to" />
+              </label>
+              <button class="btn" id="trail-load" type="button">加载</button>
+            </div>
+            <div class="range-row" id="trail-quick">
+              <button class="chip" data-minutes="60" type="button">近 1 小时</button>
+              <button class="chip" data-minutes="360" type="button">近 6 小时</button>
+              <button class="chip active" data-minutes="1440" type="button">今天</button>
+              <button class="chip" data-minutes="10080" type="button">近 7 天</button>
+            </div>
+          </div>
+
+          <div class="trail-stage">
+            <canvas id="trail-canvas"></canvas>
+            <div class="trail-overlay" id="trail-overlay">
+              <div class="trail-overlay-title" id="trail-overlay-title">还没有加载轨迹</div>
+              <div class="trail-overlay-desc" id="trail-overlay-desc">选一个时间范围，或者点上面的快捷按钮。</div>
+            </div>
+          </div>
+
+          <div class="trail-controls">
+            <button class="btn primary" id="trail-play" type="button" disabled>开始</button>
+            <button class="btn" id="trail-stop" type="button" disabled>停止</button>
+            <input type="range" id="trail-progress" min="0" max="1000" value="0" />
+            <span class="trail-clock mono" id="trail-clock">--:--:--</span>
+            <label class="field-inline">
+              <span>倍速</span>
+              <select id="trail-speed">
+                <option value="1">1×</option>
+                <option value="2">2×</option>
+                <option value="4">4×</option>
+                <option value="8" selected>8×</option>
+                <option value="16">16×</option>
+                <option value="30">30×</option>
+                <option value="60">60×</option>
+                <option value="120">120×</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="note" id="trail-note">
+            <strong>相邻采样点会连成一条折线</strong>，所以 10 Hz 的采样看起来也是连续的。
+            真实间隔超过 3 秒的地方会断开，不会凭空画出一条横穿屏幕的线。
+            <strong>播放速度</strong>：相邻两点间隔超过 2 秒时只按 2 秒推进，自动跳过你发呆的时间。
+            <strong>采样开销</strong>：最高 10 Hz、位移小于 2 像素不记，一小时约一两万个点；
+            想关掉请到「设置 → 记录鼠标轨迹」。
           </div>
         </section>
 
@@ -131,16 +203,35 @@
         <section class="page" id="page-settings">
           <div class="page-head">
             <h1 class="page-title">设置</h1>
-            <span class="page-sub">记录与保留分成两块，互不牵连</span>
+            <span class="page-sub">记录、分类、外观分开摆，互不牵连</span>
           </div>
 
-          <!-- 卡片 A：记录 -->
+          <!-- 卡片 A：外观 -->
+          <div class="settings-card">
+            <div class="settings-card-head">
+              <div class="settings-card-title">外观</div>
+              <div class="settings-card-desc">浅色主题适合白天与投影，切换立即生效，只影响这个窗口。</div>
+            </div>
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">主题</div>
+                <div class="row-desc">跟随系统时会随着 Windows / macOS 的深浅色自动切换。</div>
+              </div>
+              <div class="row-ctl" id="theme-row">
+                <button class="chip" data-theme="dark" type="button">深色</button>
+                <button class="chip" data-theme="light" type="button">浅色</button>
+                <button class="chip" data-theme="system" type="button">跟随系统</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 卡片 B：记录 -->
           <div class="settings-card">
             <div class="settings-card-head">
               <div class="settings-card-title">记录</div>
               <div class="settings-card-desc">
                 只记「按下」的瞬间：键盘一次物理按下一条，鼠标左/右/中键各一条并带点击坐标。<br />
-                不记录任何文字内容、窗口标题、剪贴板、鼠标移动与滚轮。
+                不记录任何文字内容、窗口标题、剪贴板、滚轮。
               </div>
             </div>
 
@@ -172,6 +263,22 @@
 
             <div class="row">
               <div class="row-main">
+                <div class="row-title">记录鼠标轨迹</div>
+                <div class="row-desc">
+                  额外按约 10 Hz 采样鼠标坐标，用于「轨迹」页回放。只存时间戳与坐标，
+                  不存画面、窗口标题、点击目标。<strong>默认关闭</strong>，关闭即不落盘。
+                </div>
+              </div>
+              <div class="row-ctl">
+                <label class="switch">
+                  <input type="checkbox" id="sw-trail" />
+                  <span class="switch-track"></span>
+                </label>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-main">
                 <div class="row-title">活跃判定阈值</div>
                 <div class="row-desc">
                   相邻两次输入间隔不超过该时长，这段间隔才算「连续操作」。
@@ -192,16 +299,63 @@
           </div>
 
           <div class="note">
-            <strong>关于密码：</strong>检测到密码框时会整段停止记录，并把切换前后各 300 毫秒的记录一并丢弃。
+            <strong>关于密码：</strong>检测到密码框时会整段停止记录（包括轨迹采样），并把切换前后各 300 毫秒的记录一并丢弃。
             这是刻意多丢一点，只为不漏掉密码开头的几个字母。
           </div>
 
-          <!-- 卡片 B：保留期（会删数据，物理隔开） -->
+          <!-- 卡片 C：分类 -->
+          <div class="settings-card">
+            <div class="settings-card-head">
+              <div class="settings-card-title">分类</div>
+              <div class="settings-card-desc">
+                分类存在本机 <code>settings.json</code> 里，跟输入记录放在同一个数据目录——整个目录拷走时分类会一起走。
+                它只用来给程序打标、按分类看统计，不影响任何原始记录。右下角数字是这一类挂了几个程序。
+              </div>
+            </div>
+
+            <div class="cat-list" id="cat-list"></div>
+
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">新增分类</div>
+                <div class="row-desc">图标可以直接粘一个 emoji 进去，颜色用于色点和图表。</div>
+              </div>
+              <div class="row-ctl">
+                <button class="btn primary" id="btn-cat-new" type="button">新增分类</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 卡片 D：应用分类 -->
+          <div class="settings-card">
+            <div class="settings-card-head">
+              <div class="settings-card-title">应用分类</div>
+              <div class="settings-card-desc">
+                把程序挂到分类下，统计页的「按分类」就会按这里汇总。子分类会并入它的上级分类。
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">筛选程序</div>
+                <div class="row-desc">输入进程名片段即可过滤，例如 <code>chrome</code>。</div>
+              </div>
+              <div class="row-ctl">
+                <input type="text" id="app-cat-filter" placeholder="筛选…" />
+              </div>
+            </div>
+
+            <div class="app-cat-list" id="app-cat-list">
+              <div class="chart-empty">加载中…</div>
+            </div>
+          </div>
+
+          <!-- 卡片 E：保留期（会删数据，物理隔开） -->
           <div class="settings-card danger-zone">
             <div class="settings-card-head">
               <div class="settings-card-title">保留期</div>
               <div class="settings-card-desc">
-                这一段会真的删除数据，所以单独放一张卡。<strong>改小立即生效且不可撤销</strong>，
+                这一段会真的删除数据（含轨迹采样），所以单独放一张卡。<strong>改小立即生效且不可撤销</strong>，
                 改回去也不会恢复已删的记录。
               </div>
             </div>
@@ -243,7 +397,7 @@
             </div>
           </div>
 
-          <!-- 卡片 C：数据操作 -->
+          <!-- 卡片 F：数据操作 -->
           <div class="settings-card">
             <div class="settings-card-head">
               <div class="settings-card-title">数据</div>
@@ -263,7 +417,7 @@
             <div class="row">
               <div class="row-main">
                 <div class="row-title">清空全部记录</div>
-                <div class="row-desc">删掉整个 input-log 目录，包括明细与汇总，不留残余。</div>
+                <div class="row-desc">删掉整个 input-log 目录，包括明细、汇总与轨迹采样，不留残余。</div>
               </div>
               <div class="row-ctl">
                 <button class="btn danger" id="btn-clear" type="button">清空</button>
@@ -294,7 +448,7 @@
         <p><strong>不会记录</strong></p>
         <ul>
           <li>任何文字内容、窗口标题、网页地址、剪贴板</li>
-          <li>鼠标移动轨迹与滚轮</li>
+          <li>滚轮与屏幕画面（鼠标坐标另有一个默认关闭的开关）</li>
           <li>密码框内的一切（整段跳过，前后各多丢 300 毫秒）</li>
         </ul>
         <p>
@@ -304,6 +458,28 @@
         <div class="modal-actions">
           <button class="btn" id="consent-cancel" type="button">取消</button>
           <button class="btn primary" id="consent-ok" type="button">明白了，开始记录</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 轨迹采样确认 -->
+    <div class="modal-mask" id="trail-modal">
+      <div class="modal">
+        <h3>开启鼠标轨迹采样？</h3>
+        <p><strong>会记录</strong></p>
+        <ul>
+          <li>鼠标移动时的时间戳与屏幕坐标，最高每秒 10 个点</li>
+          <li>位移小于 2 像素不记，空闲时几乎不产生数据</li>
+        </ul>
+        <p><strong>不会记录</strong></p>
+        <ul>
+          <li>屏幕画面、截图、窗口标题、点击目标、输入内容</li>
+          <li>密码框激活期间的一切坐标</li>
+        </ul>
+        <p>这些点足够还原你的操作习惯，同样只存在本机，随时可以在「设置」里关掉或清空。</p>
+        <div class="modal-actions">
+          <button class="btn" id="trail-cancel" type="button">取消</button>
+          <button class="btn primary" id="trail-ok" type="button">开启采样</button>
         </div>
       </div>
     </div>
@@ -326,10 +502,53 @@
       <div class="modal">
         <h3>清空全部输入记录？</h3>
         <p class="modal-danger" id="clear-warning">—</p>
-        <p>明细与汇总会一起删除，无法恢复。</p>
+        <p>明细、汇总与轨迹会一起删除，无法恢复。</p>
         <div class="modal-actions">
           <button class="btn" id="clear-cancel" type="button">取消</button>
           <button class="btn danger" id="clear-ok" type="button">全部删除</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 分类编辑 -->
+    <div class="modal-mask" id="cat-modal">
+      <div class="modal modal-cat">
+        <h3 id="cat-modal-title">编辑分类</h3>
+        <div class="cat-form">
+          <div class="cat-form-left">
+            <div class="field-label">图标 / 表情符号</div>
+            <div class="icon-drop">
+              <input id="cat-icon" type="text" maxlength="4" placeholder="🎮" />
+            </div>
+          </div>
+          <div class="cat-form-right">
+            <div class="field-label">分类名称</div>
+            <input id="cat-name" type="text" maxlength="20" placeholder="例如：游戏" />
+            <div class="field-label">颜色标签</div>
+            <div class="color-row">
+              <input id="cat-color-picker" type="color" value="#8b5cf6" />
+              <input id="cat-color" type="text" maxlength="7" placeholder="#8b5cf6" />
+            </div>
+          </div>
+        </div>
+        <div class="field-label">上级分类</div>
+        <select id="cat-parent"></select>
+        <div class="modal-actions">
+          <button class="btn" id="cat-cancel" type="button">取消</button>
+          <button class="btn primary" id="cat-save" type="button">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 删除分类确认 -->
+    <div class="modal-mask" id="cat-delete-modal">
+      <div class="modal">
+        <h3>删除这个分类？</h3>
+        <p class="modal-danger" id="cat-delete-warning">—</p>
+        <p>属于它的程序会回到「未分类」，子分类会上移一层；原始记录不受影响。</p>
+        <div class="modal-actions">
+          <button class="btn" id="cat-delete-cancel" type="button">取消</button>
+          <button class="btn danger" id="cat-delete-ok" type="button">删除分类</button>
         </div>
       </div>
     </div>

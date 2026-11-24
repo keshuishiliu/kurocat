@@ -9,6 +9,7 @@ mod mcp;
 mod obs;
 mod privacy;
 mod recorder;
+mod trail;
 mod tray;
 mod updater;
 #[cfg(windows)]
@@ -21,9 +22,10 @@ const WIN7_OFFSCREEN_PARK_POS: i32 = -16000;
 
 use cats::{all_cats, cat_exists, cats_path, sanitize_cat_id, CatSkinConfig};
 use config::{
-    config_path, load_settings, normalize_input_log_active_gap, normalize_input_log_retention,
-    normalize_keyboard_layout, normalize_keyboard_orientation, normalize_tail_key_ids,
-    normalize_tail_key_mode, save_settings, set_windows_autostart, AppSettings,
+    config_path, load_settings, normalize_app_categories, normalize_categories,
+    normalize_input_log_active_gap, normalize_input_log_retention, normalize_keyboard_layout,
+    normalize_keyboard_orientation, normalize_tail_key_ids, normalize_tail_key_mode, save_settings,
+    set_windows_autostart, AppSettings, CategoryDef,
 };
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -349,12 +351,21 @@ fn update_settings(app: AppHandle, state: State<'_, AppState>, mut patch: AppSet
                 patch.y = s.y;
             }
         }
+        // 分类只由统计窗口的 categories_save 写。宠物窗口发来的更新里这两项
+        // 通常是旧值（甚至空的），无条件覆盖会让用户刚排好的分类凭空消失。
+        patch.categories = s.categories.clone();
+        patch.app_categories = s.app_categories.clone();
+        // 轨迹开关同理由 input_log_set_trail 独占：宠物窗口不会改它，
+        // 但它手里那份设置可能是几小时前的快照，覆盖回去等于偷偷关掉采样。
+        patch.input_log_trail_recording = s.input_log_trail_recording;
         *s = patch.clone();
         save_settings(&s);
     }
     // 输入记录开关同步到 recorder 线程。默认关闭，只有用户显式打开才会落盘。
-    recorder::set_enabled(patch.input_log_enabled && !patch.input_log_paused);
+    let recording = patch.input_log_enabled && !patch.input_log_paused;
+    recorder::set_enabled(recording);
     recorder::set_gap_minutes(patch.input_log_active_gap_minutes);
+    trail::set_enabled(recording && patch.input_log_trail_recording);
     let _ = app.emit("kuro-settings", patch.clone());
     if size_changed {
         reposition_context_menu_if_open(&app);
@@ -372,16 +383,17 @@ fn update_settings(app: AppHandle, state: State<'_, AppState>, mut patch: AppSet
 
 #[tauri::command]
 fn input_log_stats(state: State<'_, AppState>) -> recorder::LogStatus {
-    let (enabled, paused, retention, gap) = {
+    let (enabled, paused, retention, gap, trail_on) = {
         let s = state.settings.lock().unwrap();
         (
             s.input_log_enabled,
             s.input_log_paused,
             s.input_log_retention_days,
             s.input_log_active_gap_minutes,
+            s.input_log_trail_recording,
         )
     };
-    recorder::status(enabled, paused, retention, gap)
+    recorder::status(enabled, paused, retention, gap, trail_on)
 }
 
 /// 只改三个**不动数据**的字段：开关、暂停、活跃判定阈值。
@@ -405,13 +417,94 @@ fn input_log_configure(
     };
     recorder::set_enabled(enabled && !paused);
     recorder::set_gap_minutes(next.input_log_active_gap_minutes);
+    trail::set_enabled(enabled && !paused && next.input_log_trail_recording);
     let _ = app.emit("kuro-settings", next.clone());
     recorder::status(
         next.input_log_enabled,
         next.input_log_paused,
         next.input_log_retention_days,
         next.input_log_active_gap_minutes,
+        next.input_log_trail_recording,
     )
+}
+
+/// 轨迹采样开关。与「记录输入」分开：关掉明细但留着轨迹是合理需求（反之亦然）。
+#[tauri::command]
+fn input_log_set_trail(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> recorder::LogStatus {
+    let next = {
+        let mut guard = state.settings.lock().unwrap();
+        guard.input_log_trail_recording = enabled;
+        save_settings(&guard);
+        guard.clone()
+    };
+    trail::set_enabled(next.input_log_enabled && !next.input_log_paused && enabled);
+    let _ = app.emit("kuro-settings", next.clone());
+    recorder::status(
+        next.input_log_enabled,
+        next.input_log_paused,
+        next.input_log_retention_days,
+        next.input_log_active_gap_minutes,
+        next.input_log_trail_recording,
+    )
+}
+
+#[tauri::command]
+fn input_log_trail_range() -> trail::TrailRange {
+    trail::range()
+}
+
+#[tauri::command]
+fn input_log_trail_points(
+    from: i64,
+    to: i64,
+    max_points: usize,
+) -> Result<Vec<trail::TrailPoint>, String> {
+    trail::points(from, to, max_points)
+}
+
+// ---- 分类 ----
+//
+// 与上面的输入记录命令一样：**永远不许进 MCP 工具表**。它们能读出
+// 「你用过哪些程序、分别归到哪一类」，这本身就是一份行为画像。
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CategorySnapshot {
+    categories: Vec<CategoryDef>,
+    app_categories: std::collections::BTreeMap<String, String>,
+}
+
+#[tauri::command]
+fn categories_get(state: State<'_, AppState>) -> CategorySnapshot {
+    let s = state.settings.lock().unwrap();
+    CategorySnapshot {
+        categories: s.categories.clone(),
+        app_categories: s.app_categories.clone(),
+    }
+}
+
+#[tauri::command]
+fn categories_save(
+    state: State<'_, AppState>,
+    categories: Vec<CategoryDef>,
+    app_categories: std::collections::BTreeMap<String, String>,
+) -> CategorySnapshot {
+    let clean = normalize_categories(&categories);
+    let mapped = normalize_app_categories(&app_categories, &clean);
+    {
+        let mut s = state.settings.lock().unwrap();
+        s.categories = clean.clone();
+        s.app_categories = mapped.clone();
+        save_settings(&s);
+    }
+    CategorySnapshot {
+        categories: clean,
+        app_categories: mapped,
+    }
 }
 
 #[tauri::command]
@@ -437,6 +530,16 @@ fn input_log_apply_retention(
 ) -> Result<recorder::RetentionReport, String> {
     let days = normalize_input_log_retention(days);
     let report = recorder::apply_retention(days)?;
+    // 轨迹库独立，明细清完之后顺手把同一时间点之前的采样一起删掉。
+    // 失败只影响轨迹，不影响已经成功的明细清理，所以不向上报错。
+    if days > 0 {
+        let cutoff_ts = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+            - days as i64 * 86_400_000;
+        trail::prune_before(cutoff_ts);
+    }
     let snapshot = {
         let mut guard = state.settings.lock().unwrap();
         guard.input_log_retention_days = days;
@@ -450,6 +553,8 @@ fn input_log_apply_retention(
 /// 删掉整个日志目录，不留残余。
 #[tauri::command]
 fn input_log_clear() -> Result<(), String> {
+    // 先收掉轨迹连接的句柄，否则 Windows 上 input-log 目录删不掉
+    trail::wipe();
     recorder::wipe_all()
 }
 
@@ -490,8 +595,11 @@ fn export_target_path() -> std::path::PathBuf {
 
 /// 打开统计窗口。必须是 `async fn`，否则在同步命令里 build 会死锁 Windows 事件循环
 /// （同 `open_context_menu` 的注释）。
+///
+/// 托盘菜单也走这里：菜单回调运行在主线程上，直接 build 同样会卡住事件循环，
+/// 所以托盘那边是 `async_runtime::spawn` 后再 await 这个函数。
 #[tauri::command]
-async fn open_stats_window(app: AppHandle) -> Result<(), String> {
+pub(crate) async fn open_stats_window(app: AppHandle) -> Result<(), String> {
     if let Some(existing) = app.get_webview_window("stats") {
         let _ = existing.show();
         let _ = existing.unminimize();
@@ -2218,6 +2326,10 @@ pub fn run() {
                 s.input_log_enabled && !s.input_log_paused,
                 s.input_log_active_gap_minutes,
             );
+            // 轨迹采样：三件事同时成立才开始落盘（总开关、未暂停、轨迹开关）
+            trail::init(
+                s.input_log_enabled && !s.input_log_paused && s.input_log_trail_recording,
+            );
             if s.input_log_enabled && s.input_log_retention_days > 0 {
                 let retention_handle = handle.clone();
                 let days = s.input_log_retention_days;
@@ -2231,6 +2343,13 @@ pub fn run() {
                         Ok(_) => {}
                         Err(e) => eprintln!("[recorder] 启动清理失败: {e}"),
                     }
+                    // 轨迹库是另一个文件，得单独按同一时间点清一遍
+                    let cutoff_ts = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0)
+                        - days as i64 * 86_400_000;
+                    trail::prune_before(cutoff_ts);
                 });
             }
             input_hook::start_global_hooks(handle.clone());
@@ -2336,6 +2455,11 @@ pub fn run() {
             input_log_apply_retention,
             input_log_clear,
             input_log_export,
+            input_log_set_trail,
+            input_log_trail_range,
+            input_log_trail_points,
+            categories_get,
+            categories_save,
             open_stats_window,
         ])
         .build(tauri::generate_context!())
@@ -2344,6 +2468,7 @@ pub fn run() {
             // 正常退出：把缓冲里未提交的记录刷盘，做到「正常退出丢 0 条」
             if let tauri::RunEvent::Exit = event {
                 recorder::shutdown();
+                trail::shutdown();
             }
         });
 }
