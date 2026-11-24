@@ -243,7 +243,7 @@ body {
 
 .metric-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   gap: 12px;
   margin-bottom: 14px;
 }
@@ -733,52 +733,333 @@ select:focus {
   border-color: rgba(217, 45, 45, 0.4);
 }
 
-.app-cat-list {
-  max-height: 360px;
-  overflow-y: auto;
-  padding: 4px 0;
-}
+/* ---------------- 应用库（应用分类页） ----------------
+ * 卡片式列表，对齐「应用库」参考稿：真实图标 + 中文名 + 版本 + 常驻路径 + 分类徽章。
+ * 滚动交给外层 .main，这里不再套一层滚动容器（否则会出现嵌套滚动条）。
+ */
 
-.app-cat-list::-webkit-scrollbar {
-  width: 8px;
-}
-
-.app-cat-list::-webkit-scrollbar-thumb {
-  background: var(--scroll);
-  border-radius: 5px;
-}
-
-.app-cat-row {
+.app-search {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 7px 0;
-  border-bottom: 1px solid var(--row-line);
+  height: 44px;
+  padding: 0 14px;
+  margin-bottom: 14px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
 }
 
-.app-cat-row:last-child {
-  border-bottom: 0;
+.app-search-icon {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  color: var(--faint);
 }
 
-.app-cat-name {
+.app-search input {
   flex: 1 1 auto;
   min-width: 0;
-  font-size: 12px;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+}
+
+.app-search input:focus {
+  outline: none;
+}
+
+.app-search input::placeholder {
+  color: var(--faint);
+}
+
+.app-search-count {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.app-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-bottom: 12px;
+}
+
+.app-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 16px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+}
+
+.app-card:hover {
+  border-color: var(--line-strong);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.1);
+}
+
+html[data-theme="light"] .app-card:hover {
+  box-shadow: 0 8px 22px rgba(16, 24, 40, 0.08);
+}
+
+.app-card:active {
+  transform: translateY(1px);
+}
+
+.app-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.app-card-icon {
+  flex: 0 0 auto;
+  width: 46px;
+  height: 46px;
+  border-radius: 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.app-card-icon img {
+  width: 32px;
+  height: 32px;
+  object-fit: contain;
+}
+
+.app-card-initial {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.app-card-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.app-card-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.app-card-name {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.app-cat-meta {
+.app-card-ver {
+  flex: 0 0 auto;
   font-size: 11px;
   color: var(--faint);
   font-variant-numeric: tabular-nums;
+}
+
+.app-card-path {
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-card-path.missing {
+  color: var(--faint);
+  font-style: italic;
+}
+
+.app-card-foot {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 7px;
+  font-size: 11px;
+  color: var(--faint);
+  min-width: 0;
+}
+
+.app-cat-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+  padding: 2px 9px 2px 7px;
+  border-radius: 999px;
+  background: var(--subtle);
+  border: 1px solid var(--line);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.app-cat-badge i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--cat-color, var(--accent));
   flex: 0 0 auto;
 }
 
-.app-cat-row select {
-  width: 140px;
+.app-card-sep {
+  color: var(--line-strong);
+}
+
+.app-card-spacer {
+  flex: 1 1 auto;
+}
+
+.app-card-hint {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.75;
+}
+
+/* 应用归类弹窗：头部照详情页，图标 + 名字 + 完整路径 */
+.modal.modal-app {
+  max-width: 520px;
+}
+
+.app-detail-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  padding-bottom: 15px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.app-detail-icon {
   flex: 0 0 auto;
+  width: 60px;
+  height: 60px;
+  border-radius: 14px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.app-detail-icon img {
+  width: 40px;
+  height: 40px;
+  object-fit: contain;
+}
+
+.app-detail-initial {
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.app-detail-body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.app-detail-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.app-detail-ver {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.app-detail-path {
+  margin-top: 5px;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--muted);
+  word-break: break-all;
+}
+
+.app-detail-path.missing {
+  color: var(--faint);
+  font-style: italic;
+}
+
+.app-detail-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.btn.mini {
+  padding: 4px 10px;
+  font-size: 11px;
+  border-radius: 7px;
+}
+
+.cat-pick-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.cat-pick {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 13px;
+  border-radius: 10px;
+  border: 1px solid var(--line-strong);
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.cat-pick i {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+
+.cat-pick:hover {
+  background: var(--hover);
+}
+
+.cat-pick.child {
+  margin-left: 14px;
+}
+
+.cat-pick.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  font-weight: 600;
 }
 
 /* ---------------- 轨迹 ---------------- */

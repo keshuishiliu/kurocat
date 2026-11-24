@@ -18,6 +18,8 @@
           <button class="nav-item active" data-page="dashboard" type="button">仪表盘</button>
           <button class="nav-item" data-page="stats" type="button">统计</button>
           <button class="nav-item" data-page="trail" type="button">轨迹</button>
+          <button class="nav-item" data-page="categories" type="button">分类</button>
+          <button class="nav-item" data-page="app-categories" type="button">应用分类</button>
           <button class="nav-item" data-page="settings" type="button">设置</button>
         </nav>
 
@@ -47,6 +49,11 @@
               <div class="metric-label">活跃时长</div>
               <div class="metric-value" id="dash-active">0<small>分钟</small></div>
               <div class="metric-hint" id="dash-active-hint">连续操作覆盖的时长</div>
+            </div>
+            <div class="card">
+              <div class="metric-label">前台时长</div>
+              <div class="metric-value" id="dash-focus">0<small>分钟</small></div>
+              <div class="metric-hint" id="dash-focus-hint">窗口占据前台的时长</div>
             </div>
           </div>
 
@@ -119,6 +126,11 @@
             <div class="chart-card wide">
               <div class="chart-title"><span>按程序（击键数）</span><b id="app-sum">—</b></div>
               <div class="chart-body" id="chart-app"><div class="chart-empty">加载中…</div></div>
+            </div>
+
+            <div class="chart-card wide">
+              <div class="chart-title"><span>按程序（前台时长 · 分钟）</span><b id="focus-sum">—</b></div>
+              <div class="chart-body" id="chart-focus"><div class="chart-empty">加载中…</div></div>
             </div>
 
             <div class="chart-card">
@@ -200,10 +212,61 @@
         </section>
 
         <!-- ============ 设置 ============ -->
+        <!-- ============ 分类 ============ -->
+        <section class="page" id="page-categories">
+          <div class="page-head">
+            <h1 class="page-title">分类</h1>
+            <span class="page-sub">给程序打标，统计页的「按分类」按这里汇总</span>
+          </div>
+
+          <div class="settings-card">
+            <div class="settings-card-head">
+              <div class="settings-card-title">分类列表</div>
+              <div class="settings-card-desc">
+                分类存在本机 <code>settings.json</code> 里，跟输入记录放在同一个数据目录——整个目录拷走时分类会一起走。
+                它只用来给程序打标、按分类看统计，不影响任何原始记录。右下角数字是这一类挂了几个程序。
+              </div>
+            </div>
+
+            <div class="cat-list" id="cat-list"></div>
+
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">新增分类</div>
+                <div class="row-desc">图标可以直接粘一个 emoji 进去，颜色用于色点和图表。</div>
+              </div>
+              <div class="row-ctl">
+                <button class="btn primary" id="btn-cat-new" type="button">新增分类</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ============ 应用分类 ============ -->
+        <section class="page" id="page-app-categories">
+          <div class="page-head">
+            <h1 class="page-title">应用分类</h1>
+            <span class="page-sub">按图标认程序，点卡片改归类，改完立即生效</span>
+          </div>
+
+          <div class="app-search">
+            <svg class="app-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <circle cx="11" cy="11" r="7" />
+              <path d="M16.5 16.5 21 21" stroke-linecap="round" />
+            </svg>
+            <input type="text" id="app-cat-filter" placeholder="搜索程序名、进程名或路径…" />
+            <span class="app-search-count" id="app-cat-count"></span>
+          </div>
+
+          <div class="app-card-list" id="app-cat-list">
+            <div class="chart-empty">加载中…</div>
+          </div>
+        </section>
+
         <section class="page" id="page-settings">
           <div class="page-head">
             <h1 class="page-title">设置</h1>
-            <span class="page-sub">记录、分类、外观分开摆，互不牵连</span>
+            <span class="page-sub">记录与外观，改动立即生效</span>
           </div>
 
           <!-- 卡片 A：外观 -->
@@ -303,54 +366,13 @@
             这是刻意多丢一点，只为不漏掉密码开头的几个字母。
           </div>
 
-          <!-- 卡片 C：分类 -->
-          <div class="settings-card">
-            <div class="settings-card-head">
-              <div class="settings-card-title">分类</div>
-              <div class="settings-card-desc">
-                分类存在本机 <code>settings.json</code> 里，跟输入记录放在同一个数据目录——整个目录拷走时分类会一起走。
-                它只用来给程序打标、按分类看统计，不影响任何原始记录。右下角数字是这一类挂了几个程序。
-              </div>
-            </div>
-
-            <div class="cat-list" id="cat-list"></div>
-
-            <div class="row">
-              <div class="row-main">
-                <div class="row-title">新增分类</div>
-                <div class="row-desc">图标可以直接粘一个 emoji 进去，颜色用于色点和图表。</div>
-              </div>
-              <div class="row-ctl">
-                <button class="btn primary" id="btn-cat-new" type="button">新增分类</button>
-              </div>
-            </div>
+          <div class="note">
+            <strong>关于前台计时：</strong>只在你锁屏、屏保运行、或系统休眠 / 切出当前用户时暂停计入。
+            它<strong>不看键鼠空闲</strong>——看视频、读长文档时可以十几分钟不动鼠标，那段时间照常计入；
+            代价是不锁屏就离开，时间会继续累加。
           </div>
 
-          <!-- 卡片 D：应用分类 -->
-          <div class="settings-card">
-            <div class="settings-card-head">
-              <div class="settings-card-title">应用分类</div>
-              <div class="settings-card-desc">
-                把程序挂到分类下，统计页的「按分类」就会按这里汇总。子分类会并入它的上级分类。
-              </div>
-            </div>
-
-            <div class="row">
-              <div class="row-main">
-                <div class="row-title">筛选程序</div>
-                <div class="row-desc">输入进程名片段即可过滤，例如 <code>chrome</code>。</div>
-              </div>
-              <div class="row-ctl">
-                <input type="text" id="app-cat-filter" placeholder="筛选…" />
-              </div>
-            </div>
-
-            <div class="app-cat-list" id="app-cat-list">
-              <div class="chart-empty">加载中…</div>
-            </div>
-          </div>
-
-          <!-- 卡片 E：保留期（会删数据，物理隔开） -->
+          <!-- 卡片 C：保留期（会删数据，物理隔开） -->
           <div class="settings-card danger-zone">
             <div class="settings-card-head">
               <div class="settings-card-title">保留期</div>
@@ -397,7 +419,7 @@
             </div>
           </div>
 
-          <!-- 卡片 F：数据操作 -->
+          <!-- 卡片 D：数据操作 -->
           <div class="settings-card">
             <div class="settings-card-head">
               <div class="settings-card-title">数据</div>
@@ -549,6 +571,31 @@
         <div class="modal-actions">
           <button class="btn" id="cat-delete-cancel" type="button">取消</button>
           <button class="btn danger" id="cat-delete-ok" type="button">删除分类</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 应用归类：头部照「应用库」卡片，图标 + 名称 + 完整路径，下面直接选分类 -->
+    <div class="modal-mask" id="app-cat-modal">
+      <div class="modal modal-app">
+        <div class="app-detail-head">
+          <div class="app-detail-icon" id="app-detail-icon"></div>
+          <div class="app-detail-body">
+            <div class="app-detail-title">
+              <span id="app-detail-name">—</span>
+              <span class="app-detail-ver" id="app-detail-ver"></span>
+            </div>
+            <div class="app-detail-path" id="app-detail-path">—</div>
+            <div class="app-detail-actions">
+              <button class="btn mini" id="app-detail-copy" type="button">复制路径</button>
+              <button class="btn mini" id="app-detail-reveal" type="button">打开所在文件夹</button>
+            </div>
+          </div>
+        </div>
+        <div class="field-label">归到哪个分类</div>
+        <div class="cat-pick-grid" id="app-cat-pick"></div>
+        <div class="modal-actions">
+          <button class="btn" id="app-cat-cancel" type="button">取消</button>
         </div>
       </div>
     </div>

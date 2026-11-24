@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+mod appmeta;
 mod cats;
 mod config;
 mod input_hook;
@@ -23,9 +24,9 @@ const WIN7_OFFSCREEN_PARK_POS: i32 = -16000;
 use cats::{all_cats, cat_exists, cats_path, sanitize_cat_id, CatSkinConfig};
 use config::{
     config_path, load_settings, normalize_app_categories, normalize_categories,
-    normalize_input_log_active_gap, normalize_input_log_retention, normalize_keyboard_layout,
-    normalize_keyboard_orientation, normalize_tail_key_ids, normalize_tail_key_mode, save_settings,
-    set_windows_autostart, AppSettings, CategoryDef,
+    normalize_input_log_active_gap, normalize_input_log_retention,
+    normalize_keyboard_layout, normalize_keyboard_orientation, normalize_tail_key_ids,
+    normalize_tail_key_mode, save_settings, set_windows_autostart, AppSettings, CategoryDef,
 };
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -516,6 +517,51 @@ fn input_log_summary(
     recorder::summary(&from, &to, dim)
 }
 
+/// 批量解析应用元信息（exe 路径、显示名、版本、图标）。
+/// 图标要读 exe 资源，几十个程序可能耗一两秒，必须丢进阻塞线程池，不能堵 UI 线程。
+#[tauri::command]
+async fn app_meta_get(processes: Vec<String>) -> Result<Vec<appmeta::AppMeta>, String> {
+    tauri::async_runtime::spawn_blocking(move || appmeta::resolve_many(processes))
+        .await
+        .map_err(|e| format!("解析应用信息失败: {}", e))
+}
+
+/// 每个程序最后一次有记录的日期，前端用来显示「今天 / 3 天前」。
+#[tauri::command]
+fn input_log_app_activity(from: String, to: String) -> Result<Vec<recorder::AppActivity>, String> {
+    recorder::app_last_seen(&from, &to)
+}
+
+/// 在系统文件管理器里定位到某个文件（Windows 用 `explorer /select`）。
+#[tauri::command]
+fn open_path_folder(path: String) -> Result<(), String> {
+    let target = std::path::PathBuf::from(&path);
+    if !target.exists() {
+        return Err("文件不存在，可能已被移动或删除".to_string());
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", target.to_string_lossy()))
+            .spawn()
+            .map_err(|e| format!("打开文件夹失败: {}", e))?;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(&target)
+            .spawn()
+            .map_err(|e| format!("打开文件夹失败: {}", e))?;
+        return Ok(());
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        Err("当前平台不支持定位文件".to_string())
+    }
+}
+
 #[tauri::command]
 fn input_log_retention_preview(days: u32) -> Result<recorder::RetentionPreview, String> {
     recorder::retention_preview(normalize_input_log_retention(days))
@@ -939,6 +985,27 @@ async fn install_update(app: AppHandle, info: updater::UpdateInfo) -> Result<(),
     tauri::async_runtime::spawn_blocking(move || updater::perform_update_install(&app, info))
         .await
         .map_err(|e| format!("安装更新任务异常: {}", e))?
+}
+
+/// 绿色版：查有没有「已下载但还没应用」的更新包。
+/// 启动时调用一次，让上次忽略掉的提示还能被捡回来。
+#[tauri::command]
+fn get_pending_update() -> Option<updater::PendingPortableUpdate> {
+    updater::read_pending_portable_update()
+}
+
+/// 绿色版：把已下载的更新包替换到位并重启。只在用户点「重启更新」时调用。
+#[tauri::command]
+async fn apply_portable_update(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || updater::apply_portable_update(&app))
+        .await
+        .map_err(|e| format!("应用更新任务异常: {}", e))?
+}
+
+/// 绿色版：打开更新包所在文件夹，方便用户自己看/自己换。
+#[tauri::command]
+fn reveal_update_folder() -> Result<(), String> {
+    updater::reveal_pending_update_folder()
 }
 
 #[tauri::command]
@@ -2459,11 +2526,17 @@ pub fn run() {
             create_desktop_shortcut,
             check_for_update,
             install_update,
+            get_pending_update,
+            apply_portable_update,
+            reveal_update_folder,
             open_release_page,
             quit_app,
             input_log_stats,
             input_log_configure,
             input_log_summary,
+            app_meta_get,
+            input_log_app_activity,
+            open_path_folder,
             input_log_retention_preview,
             input_log_apply_retention,
             input_log_clear,

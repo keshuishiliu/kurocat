@@ -71,10 +71,19 @@ interface UpdateProgressEvent {
   info: UpdateInfo | null;
 }
 
-let appVersion = '4.12.0';
+/** 绿色版：已下载但尚未应用的更新包（`updates\pending.json`）。 */
+interface PendingPortableUpdate {
+  version: string;
+  filePath: string;
+  sha256: string | null;
+}
+
+let appVersion = '4.13.0';
 let latestUpdateInfo: UpdateInfo | null = null;
 let updateBusy = false;
 let dismissedVersion: string | null = null;
+// 绿色版：更新包已下载、等待用户点「重启更新」时的目标版本号。
+let pendingApplyVersion: string | null = null;
 let toastAutoHideTimer: number | null = null;
 let sliderDragging = false;
 let altOverride = false;
@@ -119,6 +128,7 @@ const scaleValueEl = document.getElementById('scale-value') as HTMLButtonElement
 const updateToastEl = document.getElementById('update-toast') as HTMLDivElement;
 const updateToastTextEl = document.getElementById('update-toast-text') as HTMLSpanElement;
 const btnToastInstallEl = document.getElementById('btn-toast-install') as HTMLButtonElement;
+const btnToastRevealEl = document.getElementById('btn-toast-reveal') as HTMLButtonElement;
 const btnToastOpenEl = document.getElementById('btn-toast-open') as HTMLButtonElement;
 const btnToastCloseEl = document.getElementById('btn-toast-close') as HTMLButtonElement;
 const tailPickerBarEl = document.getElementById('tail-picker-bar') as HTMLDivElement;
@@ -400,15 +410,25 @@ function hideUpdateToast(): void {
 
 function showUpdateToast(
   text: string,
-  options: { showInstall?: boolean; showOpen?: boolean; autoHideMs?: number; busy?: boolean } = {},
+  options: {
+    showInstall?: boolean;
+    showOpen?: boolean;
+    showReveal?: boolean;
+    installLabel?: string;
+    autoHideMs?: number;
+    busy?: boolean;
+  } = {},
 ): void {
   if (toastAutoHideTimer !== null) {
     window.clearTimeout(toastAutoHideTimer);
     toastAutoHideTimer = null;
   }
   updateToastTextEl.textContent = text;
+  btnToastInstallEl.textContent = options.installLabel ?? '立即更新';
   btnToastInstallEl.classList.toggle('hidden', !options.showInstall);
   btnToastInstallEl.disabled = Boolean(options.busy);
+  btnToastRevealEl.classList.toggle('hidden', !options.showReveal);
+  btnToastRevealEl.disabled = Boolean(options.busy);
   btnToastOpenEl.classList.toggle('hidden', !options.showOpen);
   updateToastEl.classList.remove('hidden');
   void invoke('set_update_banner_open', { open: true });
@@ -437,6 +457,21 @@ function handleUpdateProgressEvent(ev: UpdateProgressEvent, fromManual = false):
       updateBusy = false;
       if (latestUpdateInfo?.hasUpdate) {
         const ver = latestUpdateInfo.latestVersion;
+        const verClean = ver.replace(/^v/i, '');
+        // 同一个版本已经下载好了：别把「已下载，可重启」降级成「发现新版本」。
+        if (
+          pendingApplyVersion &&
+          (pendingApplyVersion === verClean || pendingApplyVersion === 'new')
+        ) {
+          pendingApplyVersion = verClean;
+          setUpdateHint(`⟳ v${verClean}`, 'ready');
+          showUpdateToast(`✅ v${verClean} 已下载，重启即可更新`, {
+            showInstall: true,
+            installLabel: '重启更新',
+            showReveal: true,
+          });
+          break;
+        }
         setUpdateHint(`⬆ v${ver}`, 'ready');
         if (fromManual || dismissedVersion !== ver) {
           showUpdateToast(`✨ 发现新版本 v${ver}`, {
@@ -446,6 +481,20 @@ function handleUpdateProgressEvent(ev: UpdateProgressEvent, fromManual = false):
         }
       }
       break;
+    case 'ready': {
+      // 绿色版：更新包已落盘，只提示，不替用户决定什么时候重启。
+      updateBusy = false;
+      const rawVer = ev.info?.latestVersion || latestUpdateInfo?.latestVersion || '';
+      const ver = rawVer.replace(/^v/i, '');
+      pendingApplyVersion = ver || 'new';
+      setUpdateHint(`⟳ v${ver}`, 'ready');
+      showUpdateToast(`✅ v${ver} 已下载，重启即可更新`, {
+        showInstall: true,
+        installLabel: '重启更新',
+        showReveal: true,
+      });
+      break;
+    }
     case 'up_to_date':
       updateBusy = false;
       setUpdateHint(`✓ v${appVersion}`);
@@ -470,7 +519,26 @@ function handleUpdateProgressEvent(ev: UpdateProgressEvent, fromManual = false):
 }
 
 async function triggerInstallUpdate(): Promise<void> {
-  if (updateBusy || !latestUpdateInfo || !latestUpdateInfo.hasUpdate) return;
+  if (updateBusy) return;
+
+  // 绿色版已经下载好包：这次点击是「重启更新」，直接应用，不重复下载。
+  if (pendingApplyVersion) {
+    updateBusy = true;
+    closeContextMenu();
+    showUpdateToast('⏳ 正在应用更新并重启...', { busy: true });
+    setUpdateHint('更新中...', 'ready');
+    try {
+      await invoke('apply_portable_update');
+    } catch (err) {
+      updateBusy = false;
+      const msg = typeof err === 'string' ? err : String(err);
+      setUpdateHint('更新失败', 'error');
+      showUpdateToast(`⚠ ${msg}`, { showOpen: true, autoHideMs: 6500 });
+    }
+    return;
+  }
+
+  if (!latestUpdateInfo || !latestUpdateInfo.hasUpdate) return;
   updateBusy = true;
   closeContextMenu();
   showUpdateToast(`⏳ 正在下载 v${latestUpdateInfo.latestVersion}...`, { busy: true });
@@ -487,6 +555,11 @@ async function triggerInstallUpdate(): Promise<void> {
 
 async function triggerManualUpdateCheck(): Promise<void> {
   if (updateBusy) return;
+  // 已有下载好的包时，菜单里的「检查更新」直接变成「应用并重启」。
+  if (pendingApplyVersion) {
+    await triggerInstallUpdate();
+    return;
+  }
   // If we already know an update is ready, clicking the menu item immediately starts installing it!
   if (latestUpdateInfo?.hasUpdate && latestUpdateInfo.downloadUrl) {
     await triggerInstallUpdate();
@@ -547,9 +620,34 @@ async function bootstrap(): Promise<void> {
     handleUpdateProgressEvent(ev.payload, false);
   });
 
+  // 绿色版：上次下载完就把程序关了的话，这里把「待重启更新」的提示捡回来，
+  // 免得用户只能靠再点一次「检查更新」才能发现包已经躺在那儿了。
+  try {
+    const pending = await invoke<PendingPortableUpdate | null>('get_pending_update');
+    if (pending?.version) {
+      pendingApplyVersion = pending.version.replace(/^v/i, '');
+      setUpdateHint(`⟳ v${pendingApplyVersion}`, 'ready');
+      // 上次下载完就直接关程序的情况：这里补一次提示，不然用户永远不知道该重启。
+      showUpdateToast(`✅ v${pendingApplyVersion} 已下载，重启即可更新`, {
+        showInstall: true,
+        installLabel: '重启更新',
+        showReveal: true,
+      });
+    }
+  } catch (err) {
+    console.error('Failed to read pending update:', err);
+  }
+
   btnToastInstallEl.addEventListener('click', (e) => {
     e.stopPropagation();
     void triggerInstallUpdate();
+  });
+
+  btnToastRevealEl.addEventListener('click', (e) => {
+    e.stopPropagation();
+    void invoke('reveal_update_folder').catch((err) => {
+      console.error('Failed to reveal update folder:', err);
+    });
   });
 
   btnToastOpenEl.addEventListener('click', (e) => {

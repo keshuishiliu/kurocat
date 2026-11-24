@@ -98,10 +98,6 @@ pub fn push(x: i32, y: i32) {
     }
 }
 
-pub fn is_enabled() -> bool {
-    ENABLED.load(Ordering::Relaxed)
-}
-
 /// 启动时调用。`enabled` 必须是「总开关 && 未暂停 && 轨迹开关」三者与完的结果。
 pub fn init(enabled: bool) {
     ENABLED.store(enabled, Ordering::SeqCst);

@@ -1,0 +1,107 @@
+name: Check
+
+# 只做「编得过吗」的验证，不产包、不发版。
+# 和 release.yml 的分工：release 由 tag 触发，跑一次十几分钟且只在发版时跑；
+# 这里 push 到 main 就跑，几分钟内给出编译结论，Rust 改动不必等到打 tag 才发现错误。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支连续 push 时只保留最新一次，避免排队浪费额度。
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows (build + test)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # 前端先行：tsc 不过就不必等 Rust 了。
+      - name: TypeScript type check
+        run: npx tsc --noEmit
+
+      - name: Build frontend
+        run: npm run build
+
+      # --all-targets 连 tests/benches 一起检查；check 不做链接，出错比 build 快。
+      - name: Cargo check
+        working-directory: src-tauri
+        run: cargo check --all-targets
+
+      # 单测里带 #[cfg(windows)] 的用例（数据目录解析、递归复制、appmeta 注册表解析等）
+      # 只有在这里会真正执行——Linux job 里那些代码根本不参与编译。
+      - name: Cargo test
+        working-directory: src-tauri
+        run: cargo test
+
+  linux:
+    name: Linux (cargo check)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      # 只装 check 需要的系统库，不装打包工具链。
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Install dependencies
+        run: npm ci
+
+      # tauri-build 编译期要读 frontendDist，先出产物再 check。
+      - name: Build frontend
+        run: npm run build
+
+      # 这个 job 的唯一目的：让非 Windows 的 cfg 分支真正参与编译。
+      # updater.rs、appmeta.rs 里都有按平台分派的 cfg 块，在 Windows runner 上跑
+      # 永远看不到另一半的语法或类型错误。macOS 分支只能在 macOS runner 上验，
+      # 那部分改动仍要发版时看 release 的 macOS job。
+      - name: Cargo check (non-Windows cfg)
+        working-directory: src-tauri
+        run: cargo check --all-targets

@@ -38,7 +38,6 @@ pub const KIND_MOUSE_DOWN: i32 = 1;
 /// `flags` 位定义（与方案第二节一致）。
 pub const FLAG_SHIFT: i32 = 1 << 1;
 pub const FLAG_CAPS: i32 = 1 << 2;
-pub const FLAG_INJECTED: i32 = 1 << 3;
 
 /// 批量提交间隔。与 `PRAGMA wal_autocheckpoint = 32` 配套，把断电窗口压到约 0.5 s。
 const FLUSH_INTERVAL: Duration = Duration::from_millis(500);
@@ -50,6 +49,12 @@ const PRIVACY_GUARD_MS: i64 = 300;
 const APP_CACHE_MS: i64 = 200;
 /// 隐私窗口最多保留几段，防止长时间运行后无限增长。
 const PRIVACY_RANGES_MAX: usize = 8;
+/// 前台计时采样间隔。2 秒是精度与开销的折中：一次采样只是一次 `OpenProcess`，
+/// 而 2 秒的切换误差即使一天切 500 次窗口也只有约 16 分钟误差里的可忽略部分。
+const FOCUS_SAMPLE_MS: i64 = 2_000;
+/// 两次采样间隔超过这个值，判定为休眠/挂起（合盖、待机、进程被挂起），
+/// 这段直接丢弃——否则合盖一晚会把 8 小时算给当时的前台程序。
+const FOCUS_STALE_MS: i64 = 60_000;
 
 const META_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS apps (
@@ -84,6 +89,16 @@ CREATE TABLE IF NOT EXISTS monthly_app_keys (
     code   INTEGER NOT NULL,
     n      INTEGER NOT NULL,
     PRIMARY KEY (month, app_id, code)
+) WITHOUT ROWID;
+-- 前台计时：某程序在某个小时里真实占据了前台多少秒。
+-- 与 daily_apps.active_seconds 的口径完全不同：那个是「有多少输入在发生」，
+-- 这个是「窗口在前面挂了多久」，看视频、读文档都会被算进来。
+CREATE TABLE IF NOT EXISTS daily_app_focus (
+    day     TEXT    NOT NULL,
+    hour    INTEGER NOT NULL,
+    app_id  INTEGER NOT NULL,
+    seconds INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, hour, app_id)
 ) WITHOUT ROWID;
 "#;
 
@@ -281,6 +296,8 @@ struct Accum {
     daily_hours: HashMap<(String, u32), [i64; 2]>,
     daily_apps: HashMap<(String, i64, i32), (i64, i64)>,
     monthly_app_keys: HashMap<(String, i64, i32), i64>,
+    /// (day, hour, app_id) -> 前台秒数
+    daily_app_focus: HashMap<(String, u32, i64), i64>,
 }
 
 #[derive(Clone, Copy)]
@@ -309,6 +326,12 @@ struct Recorder {
     privacy_open: bool,
     gap_ms: i64,
     dir: PathBuf,
+    /// 上一次前台采样的时刻（ms）。`None` 表示还没采过样。
+    focus_last_ts: Option<i64>,
+    /// 上一次采样时占据前台的 app_id（-1 表示当时没有可归属的程序）。
+    focus_last_app: i64,
+    /// 采样间隔不是整秒时留下的毫秒余数，攒够 1 秒再入账，避免每次采样都截断。
+    focus_carry_ms: i64,
 }
 
 impl Recorder {
@@ -327,6 +350,9 @@ impl Recorder {
             privacy_open: false,
             gap_ms: gap_minutes.clamp(1, 120) as i64 * 60_000,
             dir: dir.to_path_buf(),
+            focus_last_ts: None,
+            focus_last_app: -1,
+            focus_carry_ms: 0,
         })
     }
 
@@ -362,6 +388,10 @@ impl Recorder {
     fn run(&mut self, rx: Receiver<Msg>) {
         let mut last_flush = Instant::now();
         loop {
+            // 每轮迭代都问一次前台计时（内部按 FOCUS_SAMPLE_MS 限流）。
+            // 放在 match 之前而不是只挂在 Timeout 上：有连续输入时 channel 一直有消息，
+            // 永远走不到 Timeout 分支，前台时间就会被整段漏掉。
+            self.sample_focus();
             let wait = FLUSH_INTERVAL.saturating_sub(last_flush.elapsed());
             match rx.recv_timeout(wait) {
                 Ok(Msg::Rec(r)) => {
@@ -373,7 +403,7 @@ impl Recorder {
                 }
                 Ok(Msg::PrivacyFlip { active, ts }) => self.apply_privacy_flip(active, ts),
                 Ok(Msg::Flush) => {
-                    self.flush();
+                    self.flush_force();
                     last_flush = Instant::now();
                 }
                 Ok(Msg::SetGap(minutes)) => {
@@ -392,7 +422,7 @@ impl Recorder {
                     last_flush = Instant::now();
                 }
                 Err(RecvTimeoutError::Disconnected) => {
-                    self.flush();
+                    self.flush_force();
                     break;
                 }
             }
@@ -514,6 +544,91 @@ impl Recorder {
         id
     }
 
+    // -- 前台计时 ----------------------------------------------------------
+
+    /// 每 `FOCUS_SAMPLE_MS` 采一次前台窗口，把「上次采样到现在」这段结算给
+    /// **上一次**占据前台的程序。
+    ///
+    /// 分段结算而不是「每次 +2 秒」：切窗口时那 2 秒算给旧窗口，既不丢也不多算。
+    /// 误差上限是一次采样间隔，一整天切几百次窗口也只有几分钟量级。
+    fn sample_focus(&mut self) {
+        let now = now_ms();
+        let Some(last) = self.focus_last_ts else {
+            // 第一次只立标杆，不记账——没有「上一次」可结算。
+            self.focus_last_ts = Some(now);
+            return;
+        };
+        let elapsed = now - last;
+        if elapsed < FOCUS_SAMPLE_MS {
+            return;
+        }
+
+        // 记录关闭 / 暂停 / 正处于隐私窗口：一律不计时。
+        // 前者是用户的明确意图；后者是「连在这个窗口待了多久都不该知道」。
+        // 顺带把游标推到 now，恢复后不会把中间那段补记上。
+        if !RECORDING.load(Ordering::Relaxed) || self.privacy_open {
+            self.focus_last_ts = Some(now);
+            self.focus_last_app = -1;
+            self.focus_carry_ms = 0;
+            return;
+        }
+
+        // 合盖、待机、进程被系统挂起：这段不是「在用」，整段丢弃。
+        // 没有这一条，合盖一晚就会把 8 小时算给关盖前的那个程序。
+        if elapsed > FOCUS_STALE_MS {
+            self.focus_last_ts = Some(now);
+            self.focus_last_app = -1;
+            self.focus_carry_ms = 0;
+            return;
+        }
+
+        // 系统进入「没人在用」的状态：锁屏、屏保、切出当前用户。同样把游标推到现在。
+        //
+        // 这里刻意**不看键鼠空闲**。看视频、读长文档时手可以一动不动十几分钟，
+        // 用空闲判定会把整段时长吃掉；而「人到底在不在」没有可靠的系统接口可问
+        // （Windows Hello 的存在检测不对普通进程开放）。所以只认系统状态：
+        // 没锁屏就认为在用，代价是不锁屏离开会照记，但行为可预测。
+        if is_system_absent() {
+            self.focus_last_ts = Some(now);
+            self.focus_last_app = -1;
+            self.focus_carry_ms = 0;
+            return;
+        }
+
+        if self.focus_last_app >= 0 && elapsed > 0 {
+            let total = elapsed + self.focus_carry_ms;
+            let secs = total / 1000;
+            self.focus_carry_ms = total % 1000;
+            if secs > 0 {
+                // 一段 2 秒跨整点时按结束时间归属，误差上限就是采样间隔。
+                let (day, hour) = day_hour_local(now);
+                *self
+                    .pending
+                    .daily_app_focus
+                    .entry((day, hour, self.focus_last_app))
+                    .or_insert(0) += secs;
+            }
+        }
+
+        self.focus_last_app = self.focus_app_now(now);
+        self.focus_last_ts = Some(now);
+    }
+
+    /// 采样专用的前台程序解析。**故意不复用 `resolve_app_id`**：那条路径会写
+    /// `app_cache`，而锁屏界面被过滤成 -1 后如果写进缓存，紧接着的真实按键就会
+    /// 跟着记成 NULL，200 ms 内都恢复不过来。
+    fn focus_app_now(&mut self, _now: i64) -> i64 {
+        let Some(name) = foreground_process() else {
+            return -1;
+        };
+        if is_ignored_focus_process(&name) {
+            return -1;
+        }
+        // 复用 upsert_app：进程名原样入库，与按键记录共用同一张 apps 表，
+        // 这样应用库、分类映射看到的就是同一行，不会凭空多出一个「Chrome」。
+        self.upsert_app(&name).unwrap_or(-1)
+    }
+
     fn upsert_app(&self, process: &str) -> rusqlite::Result<i64> {
         self.meta
             .execute("INSERT OR IGNORE INTO apps(process) VALUES(?1)", params![process])?;
@@ -527,10 +642,30 @@ impl Recorder {
     // -- 提交 --------------------------------------------------------------
 
     fn flush(&mut self) {
+        self.flush_inner(false);
+    }
+
+    /// 退出、显式 Flush 时用：不看攒够阈值，有多少写多少。
+    fn flush_force(&mut self) {
+        self.flush_inner(true);
+    }
+
+    fn flush_inner(&mut self, force: bool) {
         // 隐私兜底：翻转之前进来、还没提交的那批再滤一次（缓冲 ≤ 500 行，成本可忽略）
         self.drop_private_rows();
         if self.buf.is_empty() {
-            return;
+            if self.pending.daily_app_focus.is_empty() {
+                return;
+            }
+            // 只有前台时长在增长（看视频、读文档，一个键都不按）时，攒够 30 秒再落盘。
+            // 否则空闲状态下会变成每 2 秒一次 SQLite 事务，纯粹拿磁盘寿命换实时性。
+            // 强制 flush 不走这个阈值，否则退出时会静默丢掉最后不到 30 秒的时长。
+            if !force {
+                let pending_secs: i64 = self.pending.daily_app_focus.values().sum();
+                if pending_secs < 30 {
+                    return;
+                }
+            }
         }
 
         let acc = std::mem::take(&mut self.pending);
@@ -645,6 +780,19 @@ impl Recorder {
                     .execute(params![month, app_id, code, n])
                     .map_err(|e| e.to_string())?;
             }
+
+            let mut focus = tx
+                .prepare(
+                    "INSERT INTO daily_app_focus(day, hour, app_id, seconds) VALUES(?1, ?2, ?3, ?4) \
+                     ON CONFLICT(day, hour, app_id) DO UPDATE SET \
+                     seconds = seconds + excluded.seconds",
+                )
+                .map_err(|e| e.to_string())?;
+            for ((day, hour, app_id), secs) in &acc.daily_app_focus {
+                focus
+                    .execute(params![day, hour, app_id, secs])
+                    .map_err(|e| e.to_string())?;
+            }
         }
         tx.commit().map_err(|e| e.to_string())
     }
@@ -668,6 +816,11 @@ impl Recorder {
         self.privacy_ranges.clear();
         self.privacy_open = false;
         self.app_cache = None;
+        // 前台计时的游标也要一并归零，否则清空后的第一次采样会把「清空前那段」
+        // 结算给新库，凭空冒出一条不该存在的时长。
+        self.focus_last_ts = None;
+        self.focus_last_app = -1;
+        self.focus_carry_ms = 0;
 
         let result = fs::remove_dir_all(&self.dir).map_err(|e| format!("删除日志目录失败: {e}"));
         // 无论删除是否成功都要把连接恢复出来，否则记录功能彻底停摆
@@ -681,7 +834,8 @@ impl Recorder {
         if days == 0 {
             return Ok(RetentionReport::default());
         }
-        self.flush();
+        // 清理前把待写数据全部落盘，否则内存里那几十秒前台时长会被直接丢掉。
+        self.flush_force();
         let cutoff_ts = now_ms() - days as i64 * 86_400_000;
         let cutoff_month = month_of(cutoff_ts);
         let cutoff_day = day_hour_local(cutoff_ts).0;
@@ -725,6 +879,12 @@ impl Recorder {
             .map_err(|e| e.to_string())?;
         self.meta
             .execute("DELETE FROM daily_apps WHERE day < ?1", params![cutoff_day])
+            .map_err(|e| e.to_string())?;
+        self.meta
+            .execute(
+                "DELETE FROM daily_app_focus WHERE day < ?1",
+                params![cutoff_day],
+            )
             .map_err(|e| e.to_string())?;
         self.meta
             .execute(
@@ -840,6 +1000,48 @@ fn foreground_process() -> Option<String> {
     None
 }
 
+/// 系统当前是否处于「没人在用」的状态：锁屏、屏保运行、或会话非交互。
+///
+/// 用 `SHQueryUserNotificationState` 而不是键鼠空闲：它回答的是「用户还在不在」，
+/// 不回答「刚才有没有动鼠标」，所以看视频、读文档这种长时间不碰键鼠的场景不会被误杀。
+/// 只把 `QUNS_NOT_PRESENT` 当作不在场；`QUNS_BUSY`（全屏应用）和
+/// `QUNS_RUNNING_D3D_FULL_SCREEN`（全屏游戏/视频）恰恰是在用，必须照记。
+#[cfg(windows)]
+fn is_system_absent() -> bool {
+    use windows_sys::Win32::UI::Shell::{
+        SHQueryUserNotificationState, QUNS_NOT_PRESENT, QUERY_USER_NOTIFICATION_STATE,
+    };
+
+    unsafe {
+        let mut state: QUERY_USER_NOTIFICATION_STATE = 0;
+        // 返回 HRESULT，S_OK 才是查到了值。
+        if SHQueryUserNotificationState(&mut state) != 0 {
+            // 查不到就按「在场」处理：宁可多记，也不要因为一次 API 失败丢整段时长。
+            // 无 shell 的会话（服务、某些 de-elevated 进程）会走到这里。
+            return false;
+        }
+        state == QUNS_NOT_PRESENT
+    }
+}
+
+#[cfg(not(windows))]
+fn is_system_absent() -> bool {
+    // macOS 侧本来就没有前台程序可记（`foreground_process` 恒返回 None），这里恒 false。
+    false
+}
+
+/// 不该进前台时长榜的进程。分两类：
+/// - **人不在**：锁屏、登录界面、屏保。这几秒确实有窗口在前台，但不是「在用」。
+/// - **KuroCat 自己**：打开统计窗口看数据这个动作本身会把 KuroCat 顶上第一，
+///   污染真实排名。
+fn is_ignored_focus_process(name: &str) -> bool {
+    // 比的是去掉 .exe 的主干，这样 `KuroCat` / `KuroCat.exe` 都能命中。
+    const IGNORED: [&str; 4] = ["lockapp", "logonui", "winlogon", "kurocat"];
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+    IGNORED.contains(&stem) || lower.ends_with(".scr")
+}
+
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // 查询连接（UI 线程，独立于写连接——绝不与 recorder 线程共享）
@@ -874,6 +1076,9 @@ pub struct LogStatus {
     pub today_keydown: i64,
     pub today_mousedown: i64,
     pub active_seconds_today: i64,
+    /// 今天各程序占据前台的秒数合计。与 `active_seconds_today` 是两个不同口径，
+    /// 前者看「动手多久」，后者看「窗口在前面挂多久」。
+    pub focus_seconds_today: i64,
     pub first_day: Option<String>,
     pub last_day: Option<String>,
     pub month_tables: usize,
@@ -901,6 +1106,7 @@ pub fn status(
         today_keydown: 0,
         today_mousedown: 0,
         active_seconds_today: 0,
+        focus_seconds_today: 0,
         first_day: None,
         last_day: None,
         month_tables: 0,
@@ -944,6 +1150,13 @@ pub fn status(
             .query_row(
                 "SELECT COALESCE(SUM(active_seconds), 0) FROM daily_apps \
                  WHERE day = ?1 AND kind = 0",
+                params![today],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0);
+        st.focus_seconds_today = conn
+            .query_row(
+                "SELECT COALESCE(SUM(seconds), 0) FROM daily_app_focus WHERE day = ?1",
                 params![today],
                 |r| r.get::<_, i64>(0),
             )
@@ -993,7 +1206,11 @@ pub struct SummaryPoint {
     pub label: String,
     pub keydown: i64,
     pub mousedown: i64,
+    /// 输入活跃时长：相邻输入间隔累加，衡量「动手的密度」。
     pub active_seconds: i64,
+    /// 前台时长：窗口真实占据前台的秒数，与有没有输入无关。
+    /// 两个数放一起才看得出「开着但没动」和「真的在操作」的差别。
+    pub focus_seconds: i64,
 }
 
 /// 固定维度聚合。只接受枚举 + 日期区间，**不接受任何 SQL 片段**——
@@ -1025,6 +1242,7 @@ pub fn summary(from_day: &str, to_day: &str, dim: SummaryDim) -> Result<Vec<Summ
                         keydown: r.get(1)?,
                         mousedown: r.get(2)?,
                         active_seconds: 0,
+                        focus_seconds: 0,
                     })
                 })
                 .map_err(|e| e.to_string())?;
@@ -1048,6 +1266,25 @@ pub fn summary(from_day: &str, to_day: &str, dim: SummaryDim) -> Result<Vec<Summ
                     p.active_seconds = *v;
                 }
             }
+
+            // 前台时长同样单独聚合。它与按键是两张独立的表，join 会互相放大。
+            let focus_sql = format!(
+                "SELECT {expr} AS label, COALESCE(SUM(seconds), 0) \
+                 FROM daily_app_focus WHERE day >= ?1 AND day <= ?2 \
+                 GROUP BY label"
+            );
+            let mut focus_stmt = conn.prepare(&focus_sql).map_err(|e| e.to_string())?;
+            let focus_rows = focus_stmt
+                .query_map(params![from_day, to_day], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                })
+                .map_err(|e| e.to_string())?;
+            let focus_map: HashMap<String, i64> = focus_rows.flatten().collect();
+            for p in out.iter_mut() {
+                if let Some(v) = focus_map.get(&p.label) {
+                    p.focus_seconds = *v;
+                }
+            }
         }
         SummaryDim::Hour => {
             let mut stmt = conn
@@ -1064,21 +1301,56 @@ pub fn summary(from_day: &str, to_day: &str, dim: SummaryDim) -> Result<Vec<Summ
                         keydown: r.get(1)?,
                         mousedown: r.get(2)?,
                         active_seconds: 0,
+                        focus_seconds: 0,
                     })
                 })
                 .map_err(|e| e.to_string())?;
             out.extend(rows.flatten());
+
+            let mut focus_stmt = conn
+                .prepare(
+                    "SELECT hour, COALESCE(SUM(seconds), 0) FROM daily_app_focus \
+                     WHERE day >= ?1 AND day <= ?2 GROUP BY hour",
+                )
+                .map_err(|e| e.to_string())?;
+            let focus_rows = focus_stmt
+                .query_map(params![from_day, to_day], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                })
+                .map_err(|e| e.to_string())?;
+            let focus_map: HashMap<i64, i64> = focus_rows.flatten().collect();
+            for p in out.iter_mut() {
+                if let Ok(hour) = p.label.parse::<i64>() {
+                    if let Some(v) = focus_map.get(&hour) {
+                        p.focus_seconds = *v;
+                    }
+                }
+            }
         }
         SummaryDim::App => {
+            // 程序集合取「有按键的」∪「有前台时长的」：只用不敲的程序（看视频、
+            // 读文档）在 daily_apps 里一行都没有，必须靠 UNION 才进得来。
             let mut stmt = conn
                 .prepare(
-                    "SELECT COALESCE(a.process, 'unknown'), \
-                       COALESCE(SUM(CASE WHEN e.kind = 0 THEN e.n END), 0), \
-                       COALESCE(SUM(CASE WHEN e.kind = 1 THEN e.n END), 0), \
-                       COALESCE(SUM(CASE WHEN e.kind = 0 THEN e.active_seconds END), 0) \
-                     FROM daily_apps e LEFT JOIN apps a ON a.id = e.app_id \
-                     WHERE e.day >= ?1 AND e.day <= ?2 \
-                     GROUP BY a.process ORDER BY 2 DESC LIMIT 40",
+                    "WITH agg_keys AS ( \
+                        SELECT app_id, \
+                          COALESCE(SUM(CASE WHEN kind = 0 THEN n END), 0) AS kd, \
+                          COALESCE(SUM(CASE WHEN kind = 1 THEN n END), 0) AS md, \
+                          COALESCE(SUM(CASE WHEN kind = 0 THEN active_seconds END), 0) AS act \
+                        FROM daily_apps WHERE day >= ?1 AND day <= ?2 GROUP BY app_id \
+                     ), agg_focus AS ( \
+                        SELECT app_id, COALESCE(SUM(seconds), 0) AS fsec \
+                        FROM daily_app_focus WHERE day >= ?1 AND day <= ?2 GROUP BY app_id \
+                     ), ids AS ( \
+                        SELECT app_id FROM agg_keys UNION SELECT app_id FROM agg_focus \
+                     ) \
+                     SELECT COALESCE(a.process, 'unknown'), \
+                       COALESCE(k.kd, 0), COALESCE(k.md, 0), COALESCE(k.act, 0), COALESCE(f.fsec, 0) \
+                     FROM ids \
+                     LEFT JOIN agg_keys k ON k.app_id = ids.app_id \
+                     LEFT JOIN agg_focus f ON f.app_id = ids.app_id \
+                     LEFT JOIN apps a ON a.id = ids.app_id \
+                     ORDER BY (COALESCE(k.kd, 0) + COALESCE(f.fsec, 0)) DESC LIMIT 60",
                 )
                 .map_err(|e| e.to_string())?;
             let rows = stmt
@@ -1088,6 +1360,7 @@ pub fn summary(from_day: &str, to_day: &str, dim: SummaryDim) -> Result<Vec<Summ
                         keydown: r.get(1)?,
                         mousedown: r.get(2)?,
                         active_seconds: r.get(3)?,
+                        focus_seconds: r.get(4)?,
                     })
                 })
                 .map_err(|e| e.to_string())?;
@@ -1108,6 +1381,7 @@ pub fn summary(from_day: &str, to_day: &str, dim: SummaryDim) -> Result<Vec<Summ
                         keydown: r.get(1)?,
                         mousedown: 0,
                         active_seconds: 0,
+                        focus_seconds: 0,
                     })
                 })
                 .map_err(|e| e.to_string())?;
@@ -1121,6 +1395,36 @@ pub fn summary(from_day: &str, to_day: &str, dim: SummaryDim) -> Result<Vec<Summ
 // ---------------------------------------------------------------------------
 // 键名映射（只用于导出与图表标签，不入库）
 // ---------------------------------------------------------------------------
+
+/// 某个程序最后一次有记录是哪天。前端据此显示「今天 / 3 天前 / 26 天前」。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppActivity {
+    pub process: String,
+    pub last_day: String,
+}
+
+/// 按应用取最后活跃日期。只认键盘那一条（kind = 0），和「总计时长」口径一致。
+pub fn app_last_seen(from_day: &str, to_day: &str) -> Result<Vec<AppActivity>, String> {
+    let conn = open_meta_readonly()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT COALESCE(a.process, 'unknown'), MAX(e.day) \
+             FROM daily_apps e LEFT JOIN apps a ON a.id = e.app_id \
+             WHERE e.day >= ?1 AND e.day <= ?2 AND e.kind = 0 \
+             GROUP BY a.process",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![from_day, to_day], |r| {
+            Ok(AppActivity {
+                process: r.get(0)?,
+                last_day: r.get(1)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(rows.flatten().collect())
+}
 
 pub fn vk_label(code: i64) -> String {
     match code {
@@ -1386,6 +1690,20 @@ mod tests {
         let (day, hour) = day_hour_local(now_ms());
         assert_eq!(day.len(), 10);
         assert!(hour < 24);
+    }
+
+    #[test]
+    fn focus_ignores_lock_screen_and_itself() {
+        // 锁屏 / 登录界面不是「在用」，KuroCat 自己看统计也不算
+        assert!(is_ignored_focus_process("LockApp.exe"));
+        assert!(is_ignored_focus_process("LogonUI.exe"));
+        assert!(is_ignored_focus_process("KuroCat.exe"));
+        assert!(is_ignored_focus_process("KuroCat"));
+        assert!(is_ignored_focus_process("mystify.scr"));
+        // 正常程序必须放行，大小写不影响
+        assert!(!is_ignored_focus_process("chrome.exe"));
+        assert!(!is_ignored_focus_process("Code.exe"));
+        assert!(!is_ignored_focus_process("WeChat.exe"));
     }
 
     #[test]

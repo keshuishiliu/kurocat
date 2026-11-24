@@ -496,7 +496,9 @@ html.win7-ulw-mode .tail-picker-bar {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 268px;
+  /* 绿色版「下载完成」状态会同时出现「重启更新」+「打开文件夹」两个按钮，
+     文本区必须让位，否则 420px 的小窗会挤出胶囊。 */
+  max-width: 200px;
   font-weight: 500;
 }
 

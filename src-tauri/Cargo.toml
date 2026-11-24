@@ -1,6 +1,6 @@
 [package]
 name = "kuro-cat-pet"
-version = "4.12.0"
+version = "4.13.0"
 description = "Cross-platform desktop cat typing & mouse companion for Windows and macOS"
 authors = ["Kevin Hao"]
 edition = "2021"
@@ -46,6 +46,8 @@ windows-sys = { version = "0.59", features = [
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
   "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_Storage_FileSystem",
   "Win32_System_LibraryLoader",
   "Win32_System_Registry",
   "Win32_System_Threading",

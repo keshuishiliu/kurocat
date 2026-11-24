@@ -39,6 +39,8 @@ interface LogStatus {
   todayKeydown: number;
   todayMousedown: number;
   activeSecondsToday: number;
+  /** 今天各程序占据前台的秒数合计，与 activeSecondsToday 是两个不同口径。 */
+  focusSecondsToday: number;
   firstDay: string | null;
   lastDay: string | null;
   monthTables: number;
@@ -53,6 +55,24 @@ interface SummaryPoint {
   keydown: number;
   mousedown: number;
   activeSeconds: number;
+  focusSeconds: number;
+}
+
+/**
+ * 应用元信息（对应 src-tauri/src/appmeta.rs 的 AppMeta）。
+ * `process` 与 settings.json 里 app_categories 的 key 一致，中文名只用于展示。
+ */
+interface AppMeta {
+  process: string;
+  displayName: string | null;
+  version: string | null;
+  exePath: string | null;
+  icon: string | null;
+}
+
+interface AppActivity {
+  process: string;
+  lastDay: string;
 }
 
 interface RetentionPreview {
@@ -100,6 +120,7 @@ function demoStatus(): LogStatus {
     todayKeydown: 12_486,
     todayMousedown: 1_342,
     activeSecondsToday: 9_840,
+    focusSecondsToday: 21_360,
     firstDay: '2026-08-03',
     lastDay: '2026-11-24',
     monthTables: 4,
@@ -108,6 +129,77 @@ function demoStatus(): LogStatus {
     activeGapMinutes: 5,
     trailEnabled: true,
   };
+}
+
+/** 演示模式用的应用元信息。浏览器里打开 stats.html 时也能看到图标位、中文名和路径。 */
+const DEMO_APP_META: Record<string, { name: string; version: string; path: string }> = {
+  'code.exe': {
+    name: 'Visual Studio Code',
+    version: '1.95.3',
+    path: 'C:\\Users\\you\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe',
+  },
+  'chrome.exe': {
+    name: 'Google Chrome',
+    version: '131.0.6778',
+    path: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+  },
+  'wechat.exe': {
+    name: '微信',
+    version: '3.9.12',
+    path: 'C:\\Program Files\\Tencent\\WeChat\\WeChat.exe',
+  },
+  'kurocat.exe': {
+    name: 'Kuro 猫猫宠',
+    version: '4.13.0',
+    path: 'D:\\Programs\\kurocat\\KuroCat.exe',
+  },
+  'windowsterminal.exe': {
+    name: 'Windows 终端',
+    version: '1.21.2911',
+    path: 'C:\\Program Files\\WindowsApps\\Microsoft.WindowsTerminal\\WindowsTerminal.exe',
+  },
+  'explorer.exe': {
+    name: 'Windows 资源管理器',
+    version: '10.0.22621',
+    path: 'C:\\Windows\\explorer.exe',
+  },
+  'winword.exe': {
+    name: 'Microsoft Word',
+    version: '16.0.17928',
+    path: 'C:\\Program Files\\Microsoft Office\\root\\Office16\\WINWORD.EXE',
+  },
+  'notepad.exe': {
+    name: '记事本',
+    version: '11.2405',
+    path: 'C:\\Windows\\System32\\notepad.exe',
+  },
+  'spotify.exe': {
+    name: 'Spotify',
+    version: '1.2.47',
+    path: 'C:\\Users\\you\\AppData\\Roaming\\Spotify\\Spotify.exe',
+  },
+  'photoshop.exe': {
+    name: 'Adobe Photoshop',
+    version: '25.11',
+    path: 'C:\\Program Files\\Adobe\\Adobe Photoshop 2024\\Photoshop.exe',
+  },
+};
+
+function demoAppMeta(process: string): AppMeta {
+  const hit = DEMO_APP_META[process.toLowerCase()];
+  return {
+    process,
+    displayName: hit?.name ?? null,
+    version: hit?.version ?? null,
+    exePath: hit?.path ?? null,
+    icon: null,
+  };
+}
+
+function demoDayAgo(n: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  return dayStr(d);
 }
 
 function demoSummary(dim: string): SummaryPoint[] {
@@ -119,22 +211,29 @@ function demoSummary(dim: string): SummaryPoint[] {
       keydown: v,
       mousedown: 0,
       activeSeconds: 0,
+      focusSeconds: Math.round(v * 1.6),
     }));
   }
   if (dim === 'app') {
-    const apps: Array<[string, number]> = [
-      ['Code.exe', 48210],
-      ['chrome.exe', 31844],
-      ['WeChat.exe', 21090],
-      ['KuroCat.exe', 18730],
-      ['WindowsTerminal.exe', 15220],
-      ['explorer.exe', 9840],
-      ['WINWORD.EXE', 7420],
-      ['Notepad.exe', 5210],
-      ['Spotify.exe', 3180],
-      ['Photoshop.exe', 2140],
+    // 演示数据里刻意不放 KuroCat.exe：真实环境里它被排除在前台时长之外。
+    const apps: Array<[string, number, number]> = [
+      ['Code.exe', 48210, 14400],
+      ['chrome.exe', 31844, 10800],
+      ['WeChat.exe', 21090, 5400],
+      ['WindowsTerminal.exe', 15220, 6300],
+      ['explorer.exe', 9840, 2400],
+      ['WINWORD.EXE', 7420, 4800],
+      ['Notepad.exe', 5210, 1800],
+      ['Spotify.exe', 3180, 9600],
+      ['Photoshop.exe', 2140, 3000],
     ];
-    return apps.map(([label, keydown]) => ({ label, keydown, mousedown: 0, activeSeconds: 0 }));
+    return apps.map(([label, keydown, focusSeconds]) => ({
+      label,
+      keydown,
+      mousedown: 0,
+      activeSeconds: Math.round(keydown / 8),
+      focusSeconds,
+    }));
   }
   if (dim === 'key') {
     const keys: Array<[string, number]> = [
@@ -154,7 +253,13 @@ function demoSummary(dim: string): SummaryPoint[] {
       ['Esc', 2140],
       ['F5', 1420],
     ];
-    return keys.map(([label, keydown]) => ({ label, keydown, mousedown: 0, activeSeconds: 0 }));
+    return keys.map(([label, keydown]) => ({
+      label,
+      keydown,
+      mousedown: 0,
+      activeSeconds: 0,
+      focusSeconds: 0,
+    }));
   }
   const out: SummaryPoint[] = [];
   const today = new Date();
@@ -166,6 +271,7 @@ function demoSummary(dim: string): SummaryPoint[] {
       keydown: wave(i),
       mousedown: Math.round(wave(i) / 9),
       activeSeconds: wave(i) / 3,
+      focusSeconds: Math.round(wave(i) / 2.4),
     });
   }
   return out;
@@ -221,6 +327,14 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
       return { firstTs: Date.now() - 86_400_000, lastTs: Date.now(), points: 2400 } as unknown as T;
     case 'input_log_trail_points':
       return demoTrail(Number(args?.from ?? Date.now() - 86_400_000), Number(args?.to ?? Date.now())) as unknown as T;
+    case 'app_meta_get': {
+      const procs = (args?.processes as string[] | undefined) ?? [];
+      return procs.map(demoAppMeta) as unknown as T;
+    }
+    case 'input_log_app_activity':
+      return demoSummary('app').map((r, i) => ({ process: r.label, lastDay: demoDayAgo(i * 3) })) as unknown as T;
+    case 'open_path_folder':
+      return undefined as unknown as T;
     default:
       throw new Error(`演示模式不支持 ${cmd}`);
   }
@@ -236,6 +350,13 @@ let pendingRetentionDays: number | null = null;
 let toastTimer = 0;
 let allApps: SummaryPoint[] = [];
 let appFilter = '';
+/** 进程名（小写）→ 图标 / 中文名 / 路径 / 版本 */
+let appMetas = new Map<string, AppMeta>();
+/** 进程名（小写）→ 最后一次有记录的日期 */
+let appLastDays = new Map<string, string>();
+let appMetaLoaded = false;
+/** 当前正在弹窗编辑的程序进程名 */
+let editingApp: string | null = null;
 
 // ---------------------------------------------------------------- 主题
 
@@ -363,6 +484,11 @@ function renderStatus(st: LogStatus): void {
     st.activeSecondsToday > 0
       ? `连续操作约 ${fmtDuration(st.activeSecondsToday)}`
       : '连续操作覆盖的时长';
+  $('dash-focus').innerHTML = `${Math.round(st.focusSecondsToday / 60)}<small>分钟</small>`;
+  $('dash-focus-hint').textContent =
+    st.focusSecondsToday > 0
+      ? `窗口在前台 ${fmtDuration(st.focusSecondsToday)}`
+      : '窗口占据前台的时长';
 
   $('dash-size').textContent = fmtBytes(st.totalBytes);
   $('dash-first').textContent = st.firstDay ?? '—';
@@ -484,6 +610,17 @@ async function loadStats(): Promise<void> {
     .map((r) => ({ label: r.label, value: r.keydown }));
   renderHBars($('chart-app'), appPoints, { labelWidth: 200 });
   $('app-sum').textContent = appPoints.length ? `前 ${appPoints.length}` : '—';
+
+  // 前台时长排行：与击键排行是两回事——看视频、读文档的程序一个键都不按，
+  // 但会在这里排在前面。排序必须自己重排，不能沿用后端按「按键 + 时长」的混合序。
+  const focusPoints: Point[] = apps
+    .filter((r) => r.focusSeconds > 0)
+    .sort((a, b) => b.focusSeconds - a.focusSeconds)
+    .slice(0, 10)
+    .map((r) => ({ label: r.label, value: Math.round(r.focusSeconds / 60) }));
+  renderHBars($('chart-focus'), focusPoints, { labelWidth: 200 });
+  const focusTotal = apps.reduce((acc, r) => acc + r.focusSeconds, 0);
+  $('focus-sum').textContent = focusTotal > 0 ? fmtDuration(focusTotal) : '—';
 
   // 分类汇总：子分类并入顶层，颜色直接取分类色
   const rolled = rollupByCategory(apps.map((r) => ({ app: r.label, value: r.keydown })));
@@ -621,50 +758,144 @@ function saveCategory(): void {
   toast('分类已保存');
 }
 
+// ---------------------------------------------------------------- 应用分类
+
+function metaFor(label: string): AppMeta | undefined {
+  return appMetas.get(label.toLowerCase());
+}
+
+/** 展示名：优先软件自带的名字（微信、QQ、360压缩），没有就退回去掉扩展名的进程名。 */
+function appTitle(label: string): string {
+  const name = metaFor(label)?.displayName?.trim();
+  if (name) return name;
+  return label.replace(/\.exe$/i, '');
+}
+
+/** 没图标时的占位字：中文名首字，或进程名首字母。 */
+function appInitial(label: string): string {
+  const ch = appTitle(label).trim().charAt(0);
+  return ch ? ch.toUpperCase() : '?';
+}
+
+/** 「今天 / 昨天 / 3 天前 / 2 个月前」，按日历天算，不看时刻。 */
+function lastSeenText(process: string): string {
+  const day = appLastDays.get(process.toLowerCase());
+  if (!day) return '';
+  const [y, m, d] = day.split('-').map(Number);
+  if (!y || !m || !d) return '';
+  const today = new Date();
+  const todayMid = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const diff = Math.round((todayMid.getTime() - new Date(y, m - 1, d).getTime()) / 86_400_000);
+  if (diff <= 0) return '今天';
+  if (diff === 1) return '昨天';
+  if (diff < 30) return `${diff} 天前`;
+  if (diff < 365) return `${Math.floor(diff / 30)} 个月前`;
+  return `${Math.floor(diff / 365)} 年前`;
+}
+
 function renderAppCategoryList(): void {
   const host = $('app-cat-list');
-  const cats = listCategories();
   const filter = appFilter.trim().toLowerCase();
-  const rows = allApps
-    .filter((r) => r.keydown + r.mousedown > 0)
-    .filter((r) => !filter || r.label.toLowerCase().includes(filter));
+  const candidates = allApps.filter((r) => r.keydown + r.mousedown > 0);
+  const rows = candidates.filter((r) => {
+    if (!filter) return true;
+    const meta = metaFor(r.label);
+    const hay = [r.label, meta?.displayName ?? '', meta?.exePath ?? ''].join(' ').toLowerCase();
+    return hay.includes(filter);
+  });
+
+  const countEl = $('app-cat-count');
+  countEl.textContent = candidates.length ? `${rows.length} / ${candidates.length} 个程序` : '';
 
   if (!rows.length) {
-    host.innerHTML = '<div class="chart-empty">还没有可归类的程序，先打开「记录输入」攒一点数据。</div>';
+    host.innerHTML = filter
+      ? '<div class="chart-empty">没有匹配的程序。</div>'
+      : '<div class="chart-empty">还没有可归类的程序，先打开「记录输入」攒一点数据。</div>';
     return;
   }
 
-  const optionsFor = (selected: string) => {
-    const opts: string[] = [];
-    for (const root of cats.filter((c) => !c.parentId)) {
-      opts.push(
-        `<option value="${escapeHtml(root.id)}"${root.id === selected ? ' selected' : ''}>${escapeHtml(
-          `${root.icon} ${root.name}`,
-        )}</option>`,
-      );
-      for (const child of cats.filter((c) => c.parentId === root.id)) {
-        opts.push(
-          `<option value="${escapeHtml(child.id)}"${child.id === selected ? ' selected' : ''}>${escapeHtml(
-            `　${child.icon} ${child.name}`,
-          )}</option>`,
-        );
-      }
-    }
-    return opts.join('');
-  };
-
   host.innerHTML = rows
     .map((r) => {
-      const cid = categoryForApp(r.label).id;
+      const meta = metaFor(r.label);
+      const cat = categoryForApp(r.label);
+      const title = appTitle(r.label);
+      const path = meta?.exePath ?? '';
+      const ver = meta?.version ? `v${meta.version.replace(/^v/i, '')}` : '';
+      const icon = meta?.icon
+        ? `<img src="${meta.icon}" alt="" />`
+        : `<span class="app-card-initial">${escapeHtml(appInitial(r.label))}</span>`;
+      const seen = lastSeenText(r.label);
+      // 两个口径分开写，别合成一个数：看视频两小时前台很长、活跃是 0，
+      // 合成一个「总计」会让人以为统计坏了。
+      const durParts: string[] = [];
+      if (r.focusSeconds > 0) durParts.push(`前台 ${fmtDuration(r.focusSeconds)}`);
+      if (r.activeSeconds > 0) durParts.push(`活跃 ${fmtDuration(r.activeSeconds)}`);
+      const duration = durParts.length ? durParts.join(' · ') : '暂无计时';
       return (
-        '<div class="app-cat-row">' +
-        `<span class="app-cat-name" title="${escapeHtml(r.label)}">${escapeHtml(r.label)}</span>` +
-        `<span class="app-cat-meta">${fmtNum(r.keydown)}</span>` +
-        `<select data-app="${escapeHtml(r.label)}">${optionsFor(cid)}</select>` +
-        '</div>'
+        `<div class="app-card" data-app="${escapeHtml(r.label)}" role="button" tabindex="0">` +
+        `<div class="app-card-icon">${icon}</div>` +
+        '<div class="app-card-main">' +
+        '<div class="app-card-line">' +
+        `<span class="app-card-name" title="${escapeHtml(title)}">${escapeHtml(title)}</span>` +
+        (ver ? `<span class="app-card-ver">${escapeHtml(ver)}</span>` : '') +
+        '</div>' +
+        `<div class="app-card-path${path ? '' : ' missing'}" title="${escapeHtml(path || '未记录路径')}">${escapeHtml(
+          path || '未记录路径（程序没在运行，注册表里也没登记）',
+        )}</div>` +
+        '<div class="app-card-foot">' +
+        `<span class="app-cat-badge" style="--cat-color:${escapeHtml(cat.color)}"><i></i>${escapeHtml(
+          cat.name,
+        )}</span>` +
+        '<span class="app-card-sep">·</span>' +
+        `<span>${escapeHtml(duration)}</span>` +
+        (seen ? `<span class="app-card-sep">·</span><span>${escapeHtml(seen)}</span>` : '') +
+        '</div></div></div>'
       );
     })
     .join('');
+}
+
+function renderCategoryPicker(app: string): void {
+  const host = $('app-cat-pick');
+  const cats = listCategories();
+  const currentId = categoryForApp(app).id;
+  const button = (id: string, color: string, label: string, child = false) =>
+    `<button class="cat-pick${id === currentId ? ' active' : ''}${child ? ' child' : ''}" ` +
+    `data-cat="${escapeHtml(id)}" type="button"><i style="background:${escapeHtml(color)}"></i>` +
+    `${escapeHtml(label)}</button>`;
+
+  const parts: string[] = [];
+  for (const root of cats.filter((c) => !c.parentId)) {
+    parts.push(button(root.id, root.color, `${root.icon} ${root.name}`));
+    for (const child of cats.filter((c) => c.parentId === root.id)) {
+      parts.push(button(child.id, child.color, `${child.icon} ${child.name}`, true));
+    }
+  }
+  host.innerHTML = parts.join('');
+}
+
+function openAppCategoryModal(app: string): void {
+  editingApp = app;
+  const meta = metaFor(app);
+
+  const iconHost = $('app-detail-icon');
+  iconHost.innerHTML = meta?.icon
+    ? `<img src="${meta.icon}" alt="" />`
+    : `<span class="app-detail-initial">${escapeHtml(appInitial(app))}</span>`;
+
+  $('app-detail-name').textContent = appTitle(app);
+  $('app-detail-ver').textContent = meta?.version ? `v${meta.version.replace(/^v/i, '')}` : '';
+
+  const path = meta?.exePath ?? '';
+  const pathEl = $('app-detail-path');
+  pathEl.textContent = path || '未记录路径（程序没在运行，注册表里也没登记）';
+  pathEl.classList.toggle('missing', !path);
+
+  ($('app-detail-copy') as HTMLButtonElement).disabled = !path;
+  ($('app-detail-reveal') as HTMLButtonElement).disabled = !path;
+
+  renderCategoryPicker(app);
+  showModal('app-cat-modal');
 }
 
 async function loadApps(): Promise<void> {
@@ -673,7 +904,22 @@ async function loadApps(): Promise<void> {
   const from = status.firstDay ?? to;
   const rows = await guard(() => call<SummaryPoint[]>('input_log_summary', { from, to, dim: 'app' }));
   allApps = rows ?? [];
+  // 先用进程名出一版骨架，图标和中文名解析完再重画，避免空白等待
   renderAppCategoryList();
+
+  const missing = allApps.map((r) => r.label).filter((label) => !appMetas.has(label.toLowerCase()));
+  if (missing.length) {
+    const metas = await guard(() => call<AppMeta[]>('app_meta_get', { processes: missing }));
+    for (const meta of metas ?? []) appMetas.set(meta.process.toLowerCase(), meta);
+    renderAppCategoryList();
+  }
+
+  if (!appMetaLoaded) {
+    const acts = await guard(() => call<AppActivity[]>('input_log_app_activity', { from, to }));
+    for (const act of acts ?? []) appLastDays.set(act.process.toLowerCase(), act.lastDay);
+    appMetaLoaded = true;
+    renderAppCategoryList();
+  }
 }
 
 // ---------------------------------------------------------------- 轨迹
@@ -863,9 +1109,13 @@ function switchPage(page: string): void {
   });
   if (page === 'stats') void loadStats();
   if (page === 'trail') void openTrailPage();
-  if (page === 'settings') {
-    renderCategoryList();
-    void loadApps();
+  if (page === 'categories') renderCategoryList();
+  if (page === 'app-categories') {
+    void loadApps().then(() => {
+      // 调试用：stats.html?page=app-categories&app=chrome.exe 直接弹出归类面板
+      const app = new URLSearchParams(location.search).get('app');
+      if (app) openAppCategoryModal(app);
+    });
   }
 }
 
@@ -979,13 +1229,49 @@ function bindEvents(): void {
     renderAppCategoryList();
   });
 
-  $('app-cat-list').addEventListener('change', (ev) => {
-    const select = (ev.target as HTMLElement).closest('select');
-    if (!select) return;
-    const app = select.dataset.app;
-    if (!app) return;
-    setAppCategory(app, (select as HTMLSelectElement).value);
-    toast(`已把 ${app} 归到「${categoryForApp(app).name}」`);
+  $('app-cat-list').addEventListener('click', (ev) => {
+    const card = (ev.target as HTMLElement).closest<HTMLElement>('.app-card');
+    if (!card?.dataset.app) return;
+    openAppCategoryModal(card.dataset.app);
+  });
+
+  $('app-cat-list').addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Enter' && ev.key !== ' ') return;
+    const card = (ev.target as HTMLElement).closest<HTMLElement>('.app-card');
+    if (!card?.dataset.app) return;
+    ev.preventDefault();
+    openAppCategoryModal(card.dataset.app);
+  });
+
+  $('app-cat-pick').addEventListener('click', (ev) => {
+    const btn = (ev.target as HTMLElement).closest<HTMLElement>('.cat-pick');
+    if (!btn?.dataset.cat || !editingApp) return;
+    const target = editingApp;
+    setAppCategory(target, btn.dataset.cat);
+    toast(`已把 ${appTitle(target)} 归到「${categoryForApp(target).name}」`);
+    hideModal('app-cat-modal');
+    editingApp = null;
+    renderAppCategoryList();
+  });
+
+  $('app-cat-cancel').addEventListener('click', () => {
+    hideModal('app-cat-modal');
+    editingApp = null;
+  });
+
+  $('app-detail-copy').addEventListener('click', () => {
+    const path = editingApp ? metaFor(editingApp)?.exePath : null;
+    if (!path) return;
+    void navigator.clipboard.writeText(path).then(
+      () => toast('路径已复制'),
+      () => toast('复制失败，请手动选中路径'),
+    );
+  });
+
+  $('app-detail-reveal').addEventListener('click', () => {
+    const path = editingApp ? metaFor(editingApp)?.exePath : null;
+    if (!path) return;
+    void guard(() => call('open_path_folder', { path }));
   });
 
   // ---- 轨迹 ----
@@ -1113,7 +1399,8 @@ async function boot(): Promise<void> {
 
   // 调试用：stats.html?page=stats 直接打开某一页
   const wanted = new URLSearchParams(location.search).get('page');
-  if (wanted === 'stats' || wanted === 'settings' || wanted === 'trail') switchPage(wanted);
+  const pages = ['stats', 'settings', 'trail', 'categories', 'app-categories'];
+  if (wanted && pages.includes(wanted)) switchPage(wanted);
 
   // 菜单里改了开关，统计窗口跟着变
   if (HAS_TAURI) {

@@ -30,6 +30,28 @@ pub struct UpdateProgressEvent {
     pub info: Option<UpdateInfo>,
 }
 
+/// 绿色版（便携版）下载完但**尚未应用**的更新包。
+///
+/// 便携版不再在下载完成后立刻热替换 exe：宠物是常驻进程，强杀重启会打断正在打字的
+/// 用户。所以改为「下载 → 落盘 → 提示」，等用户点「重启更新」才真正替换二进制。
+/// 标记存在 `updates\pending.json`，跟着绿色版文件夹走，拷走目录也不会丢状态。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingPortableUpdate {
+    /// 目标版本号，保留原始 tag 形态（可能带 `v` 前缀）。
+    pub version: String,
+    /// 已落盘的更新包绝对路径（`.exe.new`，双击不会误启动）。
+    pub file_path: String,
+    /// 发布页给出的 SHA-256，应用前再复验一次，防止目录里的文件被替换或损坏。
+    pub sha256: Option<String>,
+}
+
+impl PendingPortableUpdate {
+    pub fn file(&self) -> PathBuf {
+        PathBuf::from(&self.file_path)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct GhRelease {
     tag_name: String,
@@ -726,6 +748,171 @@ pub fn open_url_in_browser(url: &str) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 绿色版（便携版）更新包的落盘位置与待更新标记
+// ---------------------------------------------------------------------------
+
+/// 把任意版本串收成安全的文件名片段，防止 tag 里混进路径分隔符。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn sanitize_version(raw: &str) -> String {
+    let cleaned: String = raw
+        .trim()
+        .trim_start_matches(['v', 'V'])
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
+        .collect();
+    if cleaned.is_empty() {
+        "unknown".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// 绿色版更新包目录：优先 exe 同级的 `updates\`，让「整个文件夹拷走就是搬家」的语义
+/// 继续成立，用户也能自己找到下载好的包。该目录不可写（装进 Program Files、只读介质、
+/// 直接双击 zip 里的 exe 而落在临时解压目录）时退回 `%APPDATA%\kuro-cat-pet\updates`。
+#[cfg(windows)]
+pub fn portable_update_dir() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let cand = dir.join("updates");
+            if std::fs::create_dir_all(&cand).is_ok() {
+                let probe = cand.join(format!(".kurocat-probe-{}", std::process::id()));
+                let _ = std::fs::remove_file(&probe);
+                let writable = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&probe)
+                    .is_ok();
+                if writable {
+                    let _ = std::fs::remove_file(&probe);
+                    return cand;
+                }
+            }
+        }
+    }
+    let fallback = std::env::var("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("kuro-cat-pet")
+        .join("updates");
+    let _ = std::fs::create_dir_all(&fallback);
+    fallback
+}
+
+#[cfg(windows)]
+fn pending_marker_path() -> PathBuf {
+    portable_update_dir().join("pending.json")
+}
+
+#[cfg(windows)]
+fn clear_pending_portable_update() {
+    let _ = std::fs::remove_file(pending_marker_path());
+}
+
+#[cfg(windows)]
+fn write_pending_portable_update(pending: &PendingPortableUpdate) -> Result<(), String> {
+    let path = pending_marker_path();
+    let json = serde_json::to_string_pretty(pending)
+        .map_err(|e| format!("序列化更新标记失败: {}", e))?;
+    std::fs::write(&path, json).map_err(|e| format!("写入更新标记失败: {}", e))
+}
+
+/// 读取待应用的更新包。四重过滤：标记可读、文件还在（或已随文件夹移动）、
+/// 版本确实比当前新、过期残留自动清理。
+///
+/// 绿色版目录被整个拷到另一台机器时，标记会跟着走，版本比对可以避免假提示。
+#[cfg(windows)]
+fn read_pending_windows() -> Option<PendingPortableUpdate> {
+    let raw = std::fs::read_to_string(pending_marker_path()).ok()?;
+    let mut pending: PendingPortableUpdate = serde_json::from_str(&raw).ok()?;
+
+    if !pending.file().is_file() {
+        // 用户把绿色版文件夹整体挪了位置：绝对路径失效，但包还在同名的 updates\ 里。
+        let relocated = pending
+            .file()
+            .file_name()
+            .map(|name| portable_update_dir().join(name));
+        match relocated {
+            Some(path) if path.is_file() => {
+                pending.file_path = path.to_string_lossy().to_string();
+            }
+            _ => {
+                clear_pending_portable_update();
+                return None;
+            }
+        }
+    }
+
+    if !is_newer_version(&pending.version, CURRENT_VERSION) {
+        let _ = std::fs::remove_file(pending.file());
+        clear_pending_portable_update();
+        return None;
+    }
+    Some(pending)
+}
+
+pub fn read_pending_portable_update() -> Option<PendingPortableUpdate> {
+    #[cfg(windows)]
+    {
+        return read_pending_windows();
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// 打开更新包所在文件夹并选中文件（`explorer /select`）。
+pub fn reveal_pending_update_folder() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let target = read_pending_portable_update()
+            .map(|p| p.file())
+            .unwrap_or_else(portable_update_dir);
+        // explorer 的 /select 需要「一个」参数，路径含空格时由 Command 自行加引号。
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", target.to_string_lossy()))
+            .spawn()
+            .map_err(|e| format!("打开文件夹失败: {}", e))?;
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    {
+        Err("当前平台没有需要手动查看的更新包".to_string())
+    }
+}
+
+/// 复验已落盘的更新包：目录里的文件可能被用户替换、被安全软件改写或写坏。
+#[cfg(windows)]
+fn hash_file_sha256(path: &PathBuf) -> Result<String, String> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path).map_err(|e| format!("打开更新包失败: {}", e))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buf)
+            .map_err(|e| format!("读取更新包失败: {}", e))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hasher.finish_hex())
+}
+
+/// 安装器/新进程已经接棒，旧进程留一点时间把日志刷完再退。
+#[cfg(windows)]
+fn schedule_process_exit(app: &AppHandle) {
+    let app_clone = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(450));
+        app_clone.exit(0);
+    });
+}
+
 #[cfg(windows)]
 fn download_and_verify_windows(url: &str, dest: &PathBuf, expected_sha256: Option<&str>) -> Result<(), String> {
     use std::io::Write;
@@ -807,6 +994,7 @@ fn install_windows_update(app: &AppHandle, info: &UpdateInfo) -> Result<(), Stri
         .asset_name
         .as_deref()
         .unwrap_or("KuroCat-update.exe");
+    let is_setup_installer = asset_name.to_ascii_lowercase().ends_with("-setup.exe");
 
     emit_progress(
         app,
@@ -815,68 +1003,132 @@ fn install_windows_update(app: &AppHandle, info: &UpdateInfo) -> Result<(), Stri
         Some(info.clone()),
     );
 
-    let temp_dir = std::env::temp_dir().join("kurocat-updates");
-    let _ = std::fs::create_dir_all(&temp_dir);
-    let safe_name = asset_name.replace(['\\', '/', ':', '*', '?', '"', '<', '>', '|'], "_");
-    let target_file = temp_dir.join(safe_name);
+    // 安装版装完由 NSIS 安装器接管，落在 %TEMP% 就行；
+    // 绿色版要让用户之后能自己找到这个包，所以落到 exe 同级的 updates\。
+    let target_file = if is_setup_installer {
+        let temp_dir = std::env::temp_dir().join("kurocat-updates");
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let safe_name = asset_name.replace(['\\', '/', ':', '*', '?', '"', '<', '>', '|'], "_");
+        temp_dir.join(safe_name)
+    } else {
+        // `.exe.new` 后缀：用户误双击 updates\ 里的包时不会启动一个
+        // 「数据目录变成 updates\data」的野生实例。
+        portable_update_dir().join(format!(
+            "KuroCat-{}.exe.new",
+            sanitize_version(&info.latest_version)
+        ))
+    };
 
     download_and_verify_windows(url, &target_file, info.asset_sha256.as_deref())?;
 
-    emit_progress(
-        app,
-        "installing",
-        format!("校验通过，正在安装 v{} 并重启...", info.latest_version),
-        Some(info.clone()),
-    );
-
-    let is_setup_installer = asset_name.to_ascii_lowercase().ends_with("-setup.exe");
-
     if is_setup_installer {
         // Launch Tauri NSIS installer in passive auto-relaunch update mode (/P /R /UPDATE)
+        emit_progress(
+            app,
+            "installing",
+            format!("校验通过，正在安装 v{} 并重启...", info.latest_version),
+            Some(info.clone()),
+        );
         Command::new(&target_file)
             .args(["/P", "/R", "/UPDATE"])
             .spawn()
             .map_err(|e| format!("启动安装程序失败: {}", e))?;
-    } else {
-        // Zero-PowerShell portable atomic swap: Windows allows renaming a running .exe in place,
-        // so we move the running binary aside, copy the verified new binary into place, and launch
-        // the new process with --wait-pid + --cleanup-old-exe to remove the old binary once we exit.
-        let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let pid = std::process::id();
-        let old_exe = current_exe.with_extension("exe.old");
-        let _ = std::fs::remove_file(&old_exe);
+        schedule_process_exit(app);
+        return Ok(());
+    }
 
-        std::fs::rename(&current_exe, &old_exe)
-            .map_err(|e| format!("备份旧版本程序失败: {}", e))?;
-
-        if let Err(e) = std::fs::copy(&target_file, &current_exe) {
-            let _ = std::fs::rename(&old_exe, &current_exe);
-            return Err(format!("替换新版本程序失败: {}", e));
-        }
+    // 绿色版：只落盘 + 写待更新标记，**不**替换二进制、**不**重启。
+    // 宠物是常驻进程，下载完就强杀重启会打断用户正在做的事；交给用户点「重启更新」。
+    let pending = PendingPortableUpdate {
+        version: info.latest_version.clone(),
+        file_path: target_file.to_string_lossy().to_string(),
+        sha256: info.asset_sha256.clone(),
+    };
+    if let Err(err) = write_pending_portable_update(&pending) {
         let _ = std::fs::remove_file(&target_file);
+        return Err(err);
+    }
 
-        if let Err(e) = Command::new(&current_exe)
-            .args([
-                "--wait-pid",
-                &pid.to_string(),
-                "--cleanup-old-exe",
-                &old_exe.to_string_lossy(),
-            ])
-            .spawn()
-        {
-            let _ = std::fs::remove_file(&current_exe);
-            let _ = std::fs::rename(&old_exe, &current_exe);
-            return Err(format!("启动新版本程序失败: {}", e));
+    emit_progress(
+        app,
+        "ready",
+        format!(
+            "v{} 已下载完成，点「重启更新」即可生效",
+            sanitize_version(&info.latest_version)
+        ),
+        Some(info.clone()),
+    );
+    Ok(())
+}
+
+/// 把已落盘的绿色版更新包应用到位，然后拉起新进程接管。
+///
+/// 这一步由用户点「重启更新」触发，或者用户在下次启动后再次点「检查更新」触发。
+/// 顺序与旧的自替换逻辑一致：先给旧 exe 改名让位（Windows 允许 rename 正在运行的
+/// exe），再复制新文件进来，最后拉新进程并把 `.exe.old` 交给它清理。任一步失败都
+/// 回滚到旧 exe，保证程序始终有一个可运行的二进制。
+#[cfg(windows)]
+pub fn apply_portable_update(app: &AppHandle) -> Result<(), String> {
+    use std::process::Command;
+
+    let Some(pending) = read_pending_portable_update() else {
+        return Err("没有已下载的更新包，请先检查更新".to_string());
+    };
+    let update_file = pending.file();
+
+    // 复验摘要：包落在用户可写的目录里，下载之后可能被替换或写坏。
+    if let Some(expected) = pending.sha256.as_deref() {
+        let actual = hash_file_sha256(&update_file)?;
+        if !actual.eq_ignore_ascii_case(expected.trim()) {
+            let _ = std::fs::remove_file(&update_file);
+            clear_pending_portable_update();
+            return Err("更新包校验失败，已删除，请重新下载".to_string());
         }
     }
 
-    let app_clone = app.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(450));
-        app_clone.exit(0);
-    });
+    emit_progress(
+        app,
+        "installing",
+        format!("正在应用 v{} 并重启...", pending.version),
+        None,
+    );
 
+    let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let pid = std::process::id();
+    let old_exe = current_exe.with_extension("exe.old");
+    let _ = std::fs::remove_file(&old_exe);
+
+    std::fs::rename(&current_exe, &old_exe)
+        .map_err(|e| format!("备份旧版本程序失败: {}", e))?;
+
+    if let Err(e) = std::fs::copy(&update_file, &current_exe) {
+        let _ = std::fs::rename(&old_exe, &current_exe);
+        return Err(format!("替换新版本程序失败: {}", e));
+    }
+    let _ = std::fs::remove_file(&update_file);
+    clear_pending_portable_update();
+
+    if let Err(e) = Command::new(&current_exe)
+        .args([
+            "--wait-pid",
+            &pid.to_string(),
+            "--cleanup-old-exe",
+            &old_exe.to_string_lossy(),
+        ])
+        .spawn()
+    {
+        let _ = std::fs::remove_file(&current_exe);
+        let _ = std::fs::rename(&old_exe, &current_exe);
+        return Err(format!("启动新版本程序失败: {}", e));
+    }
+
+    schedule_process_exit(app);
     Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn apply_portable_update(_app: &AppHandle) -> Result<(), String> {
+    Err("当前平台不需要手动应用更新包".to_string())
 }
 
 #[cfg(target_os = "macos")]
@@ -1135,6 +1387,20 @@ pub fn start_background_update_checker(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portable_asset_name_is_sanitized() {
+        // tag 里混进路径分隔符时不能拼出目录穿越的文件名
+        assert_eq!(sanitize_version("v4.13.0"), "4.13.0");
+        assert_eq!(sanitize_version("V4.13.0"), "4.13.0");
+        assert_eq!(sanitize_version("4.13.0-beta.1"), "4.13.0-beta.1");
+        assert_eq!(sanitize_version("../../evil"), "....evil");
+        let traversal = sanitize_version("../\\/x");
+        assert!(!traversal.contains('/'));
+        assert!(!traversal.contains('\\'));
+        assert_eq!(sanitize_version("v"), "unknown");
+        assert_eq!(sanitize_version("   "), "unknown");
+    }
 
     #[test]
     fn semver_comparison_works() {

@@ -42,6 +42,13 @@ interface UpdateInfo {
   notesSummary: string;
 }
 
+/** 绿色版：已下载但还没应用的更新包。 */
+interface PendingPortableUpdate {
+  version: string;
+  filePath: string;
+  sha256: string | null;
+}
+
 const TAIL_MODE_LABELS: Record<TailKeyMode, string> = {
   smart: '智能第三只手',
   custom: '自定义按键',
@@ -73,7 +80,7 @@ let settings: AppSettings = {
 
 let catList: CatSkinConfig[] = [...DEFAULT_BUILTIN_CATS];
 let sliderDragging = false;
-let currentAppVersion = '4.12.0';
+let currentAppVersion = '4.13.0';
 
 const menuEl = document.getElementById('context-menu') as HTMLDivElement;
 const breedPillsEl = document.getElementById('breed-pills') as HTMLDivElement;
@@ -275,6 +282,17 @@ async function createDesktopShortcut(): Promise<void> {
 async function triggerManualUpdateCheck(): Promise<void> {
   const hint = document.getElementById('update-hint');
   if (hint) hint.textContent = '检查中…';
+  // 绿色版：已经有下载好的包时，这一项直接变成「应用并重启」，不再走网络检查。
+  try {
+    const pending = await invoke<PendingPortableUpdate | null>('get_pending_update');
+    if (pending?.version) {
+      if (hint) hint.textContent = '应用更新中…';
+      await invoke('apply_portable_update');
+      return;
+    }
+  } catch {
+    // 没有待更新包，继续正常检查
+  }
   try {
     const info = await invoke<UpdateInfo>('check_for_update');
     if (info.hasUpdate) {
@@ -316,6 +334,14 @@ async function bootstrap(): Promise<void> {
       currentAppVersion = ver;
       const hint = document.getElementById('update-hint');
       if (hint) hint.textContent = `v${ver}`;
+      // 绿色版有待应用的更新包时，把版本徽标换成「⟳ 待更新」提示
+      try {
+        const pending = await invoke<PendingPortableUpdate | null>('get_pending_update');
+        const pendingVer = pending?.version?.replace(/^v/i, '');
+        if (pendingVer && hint) hint.textContent = `⟳ v${pendingVer}`;
+      } catch {
+        // 没有待更新包，保持显示当前版本
+      }
     }
   } catch (err) {
     console.error('Failed to load menu state:', err);
