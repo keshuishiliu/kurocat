@@ -50,6 +50,11 @@ jobs:
       - name: Build Tauri app (Windows x64 - 65% Classic Installer)
         run: npm run tauri -- build --bundles nsis
 
+      # 数据目录解析、递归复制等逻辑都带 #[cfg(windows)]，在 Linux job 里根本不编译，
+      # 所以必须在 Windows 上单跑一次。--release 复用上一步的依赖缓存，代价很小。
+      - name: Run Windows Rust unit tests
+        run: cargo test --release --manifest-path src-tauri/Cargo.toml
+
       - name: Package Windows assets (installer + portable)
         shell: pwsh
         run: |
