@@ -595,11 +595,8 @@ fn export_target_path() -> std::path::PathBuf {
 
 /// 打开统计窗口。必须是 `async fn`，否则在同步命令里 build 会死锁 Windows 事件循环
 /// （同 `open_context_menu` 的注释）。
-///
-/// 托盘菜单也走这里：菜单回调运行在主线程上，直接 build 同样会卡住事件循环，
-/// 所以托盘那边是 `async_runtime::spawn` 后再 await 这个函数。
 #[tauri::command]
-pub(crate) async fn open_stats_window(app: AppHandle) -> Result<(), String> {
+async fn open_stats_window(app: AppHandle) -> Result<(), String> {
     if let Some(existing) = app.get_webview_window("stats") {
         let _ = existing.show();
         let _ = existing.unminimize();
@@ -625,6 +622,22 @@ pub(crate) async fn open_stats_window(app: AppHandle) -> Result<(), String> {
     .map_err(|e| format!("创建统计窗口失败: {e}"))?;
     let _ = created.set_focus();
     Ok(())
+}
+
+/// 非 IPC 场景（托盘菜单）打开统计窗口。
+///
+/// 托盘菜单回调运行在主线程上，直接 build 窗口会卡死 Windows 事件循环，所以扔到
+/// async runtime 再 await 上面那个命令函数。
+///
+/// 注意别把上面的命令函数改成 `pub(crate)` 再直接调用：`#[tauri::command]` 会为命令
+/// 生成 `__cmd__xxx` 宏 + 同名 use 导入，非 `pub` 可见性下这两者会在宏命名空间里撞车
+/// （E0255 定义了多次）。包装函数不带宏，是安全的那个入口。
+pub(crate) fn spawn_open_stats_window(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        if let Err(err) = open_stats_window(app).await {
+            eprintln!("[stats] 打开输入统计失败: {err}");
+        }
+    });
 }
 
 const SIDE_MENU_LOGICAL_W: f64 = 266.0;

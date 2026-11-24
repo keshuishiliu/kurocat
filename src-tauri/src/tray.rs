@@ -424,14 +424,9 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
                     set_pet_visible(app, !next);
                 }
                 "open_stats" => {
-                    // 菜单回调跑在主线程上，直接建窗口会把 WebView2 的 build 卡住
-                    // （同 open_stats_window 注释里的死锁），所以扔到 async runtime 里做。
-                    let handle = app.clone();
-                    tauri::async_runtime::spawn(async move {
-                        if let Err(err) = crate::open_stats_window(handle).await {
-                            eprintln!("[tray] 打开输入统计失败: {err}");
-                        }
-                    });
+                    // 菜单回调跑在主线程上，直接建窗口会把 WebView2 的 build 卡住，
+                    // 由 lib 里那个包装函数挪到 async runtime 后再做。
+                    crate::spawn_open_stats_window(app.clone());
                 }
                 #[cfg(windows)]
                 "restart_as_admin" => {
