@@ -5,9 +5,9 @@
 
 # 🐈‍⬛ KuroCat（衍生修改版）
 
-**当前版本 `v4.10.0`**（= 上游 v4.9.1 + 本仓库改动）。App 内「检查更新」与更新包地址校验已改为锚定本仓库 [keshuishiliu/kurocat](https://github.com/keshuishiliu/kurocat) Releases，不再跟随上游发布通道。
+**当前版本 `v4.10.1`**（= 上游 v4.9.1 + 本仓库改动）。App 内「检查更新」与更新包地址校验已改为锚定本仓库 [keshuishiliu/kurocat](https://github.com/keshuishiliu/kurocat) Releases，不再跟随上游发布通道。
 
-**下载**：[Releases · v4.10.0](https://github.com/keshuishiliu/kurocat/releases/latest) —— Windows 安装包 / macOS Universal `dmg` / Linux `deb` + `AppImage`，由 GitHub Actions 三平台构建，安装包未签名。
+**下载**：[Releases · v4.10.1](https://github.com/keshuishiliu/kurocat/releases/latest) —— Windows 安装包 / macOS Universal `dmg` / Linux `deb` + `AppImage`，由 GitHub Actions 三平台构建，安装包未签名。
 
 ## 目录
 
@@ -226,6 +226,6 @@ cd src-tauri && cargo build
 
 ## 七、协议
 
-上游与本仓库改动均以 [MIT License](LICENSE) 发布，版权归原作者 [qianyiai](https://github.com/qianyiai) 所有。
+本项目以 [MIT License](LICENSE) 发布，许可证全文与版权声明见仓库根目录的 [`LICENSE`](LICENSE)。
 
 内置皮肤 **🐳 大肥鱼（鲸鱼娘）** 运行时素材基于 MIT 开源项目 [PC2005-cloud/dsh-pet](https://github.com/PC2005-cloud/dsh-pet)（参考衍生 [QCYTSN/dsh-dafeiyu](https://github.com/QCYTSN/dsh-dafeiyu)）制作，完整许可声明见 `src/assets/dafeiyu/LICENSE-MIT.txt`。
