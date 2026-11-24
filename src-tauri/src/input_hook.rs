@@ -70,10 +70,64 @@ static KEY_EVENTS_RECEIVED: AtomicU64 = AtomicU64::new(0);
 static ALT_HELD: AtomicBool = AtomicBool::new(false);
 static HOOKS_PAUSED: AtomicBool = AtomicBool::new(false);
 static PASSWORD_PRIVACY_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// 供输入记录器还原大小写用。只在 dispatcher 线程读写，Relaxed 足够。
+static SHIFT_HELD: AtomicBool = AtomicBool::new(false);
+static CAPS_ON: AtomicBool = AtomicBool::new(false);
 
 pub fn set_password_privacy_active(active: bool) {
-    PASSWORD_PRIVACY_ACTIVE.store(active, Ordering::SeqCst);
+    let prev = PASSWORD_PRIVACY_ACTIVE.swap(active, Ordering::SeqCst);
+    if prev != active {
+        // recorder 侧要把翻转前后 300ms 的记录一并丢弃：
+        // privacy.rs 是 140ms 轮询，点进密码框后最多 140ms 内按键仍会被当普通键送出去
+        crate::recorder::mark_privacy_flip(active);
+    }
 }
+
+fn is_shift_vk(vk: u32) -> bool {
+    matches!(vk, 0x10 | 0xA0 | 0xA1)
+}
+
+/// 鼠标按钮名 → 入库用的 code（0 左 / 1 右 / 2 中）。
+fn mouse_code(btn: &str) -> Option<i32> {
+    match btn {
+        "left" => Some(0),
+        "right" => Some(1),
+        "middle" => Some(2),
+        _ => None,
+    }
+}
+
+fn current_modifier_flags() -> i32 {
+    let mut flags = 0;
+    if SHIFT_HELD.load(Ordering::Relaxed) {
+        flags |= crate::recorder::FLAG_SHIFT;
+    }
+    if CAPS_ON.load(Ordering::Relaxed) {
+        flags |= crate::recorder::FLAG_CAPS;
+    }
+    flags
+}
+
+/// 启动时对齐一次真实修饰键状态，避免程序启动前就按下的 Shift/Caps 与内存不一致。
+#[cfg(windows)]
+fn init_modifier_state() {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_CAPITAL, VK_LSHIFT, VK_RSHIFT,
+    };
+    unsafe {
+        CAPS_ON.store(
+            (GetAsyncKeyState(VK_CAPITAL as i32) as u16 & 1) != 0,
+            Ordering::Relaxed,
+        );
+        let shift = (GetAsyncKeyState(VK_LSHIFT as i32) as u16 & 0x8000) != 0
+            || (GetAsyncKeyState(VK_RSHIFT as i32) as u16 & 0x8000) != 0;
+        SHIFT_HELD.store(shift, Ordering::Relaxed);
+    }
+}
+
+#[cfg(not(windows))]
+fn init_modifier_state() {}
+
 #[cfg(windows)]
 static WIN_HOOK_TID: AtomicU32 = AtomicU32::new(0);
 #[cfg(windows)]
@@ -345,6 +399,7 @@ pub fn linux_evdev_to_vk(code: u16) -> Option<u32> {
 pub fn start_global_hooks(app: AppHandle) {
     let (tx, rx) = mpsc::channel::<RawHookMsg>();
     let _ = HOOK_TX.set(tx);
+    init_modifier_state();
 
     // Dispatcher thread: deduplicates held key repeats & dual-channel macOS events,
     // throttles mouse moves to ~60Hz, and reconciles lost KeyUp/MouseUp events (Fixes #3 & #4).
@@ -353,6 +408,9 @@ pub fn start_global_hooks(app: AppHandle) {
         let mut last_mouse_emit = Instant::now() - Duration::from_secs(1);
         let mut mouse_down = [false; 3]; // 0: left, 1: right, 2: middle
         let mut last_reconcile = Instant::now();
+        // 点击坐标取「最后一次鼠标移动的位置」。移动流本身不入库，
+        // 只在内存里留这一个点，点击时带走——省掉一整套轨迹子系统。
+        let mut last_cursor: Option<(i32, i32)> = None;
 
         let btn_index = |btn: &str| -> Option<usize> {
             match btn {
@@ -491,6 +549,20 @@ pub fn start_global_hooks(app: AppHandle) {
                         if let Some(repeat) = dedup.on_key_down(vk, source, Instant::now()) {
                             if !repeat {
                                 KEY_EVENTS_RECEIVED.fetch_add(1, Ordering::Relaxed);
+                                // 一次物理按下一条记录：repeat（长按自动重复）在这里被丢弃。
+                                // 修饰键状态必须先更新，再取 flags，否则 Shift+A 的 A 拿不到 shift 位。
+                                if is_shift_vk(vk) {
+                                    SHIFT_HELD.store(true, Ordering::Relaxed);
+                                } else if vk == 0x14 {
+                                    CAPS_ON.fetch_xor(true, Ordering::Relaxed);
+                                }
+                                crate::recorder::push(
+                                    crate::recorder::KIND_KEY_DOWN,
+                                    vk as i32,
+                                    current_modifier_flags(),
+                                    None,
+                                    None,
+                                );
                             }
                             emit_input(&app, InputEvent::KeyDown { vk, scan, repeat });
                         }
@@ -499,6 +571,10 @@ pub fn start_global_hooks(app: AppHandle) {
                         if is_alt_vk(vk) {
                             ALT_HELD.store(false, Ordering::Relaxed);
                         }
+                        if is_shift_vk(vk) {
+                            SHIFT_HELD.store(false, Ordering::Relaxed);
+                        }
+                        // 抬起事件不进数据库：只更新修饰键状态并照旧驱动猫咪动画
                         if PASSWORD_PRIVACY_ACTIVE.load(Ordering::Relaxed) {
                             let _ = dedup.on_key_up(vk, source);
                             continue;
@@ -510,6 +586,19 @@ pub fn start_global_hooks(app: AppHandle) {
                     RawHookMsg::MouseDown(btn) => {
                         if let Some(i) = btn_index(btn) {
                             mouse_down[i] = true;
+                        }
+                        if let Some(code) = mouse_code(btn) {
+                            let (x, y) = match last_cursor {
+                                Some((cx, cy)) => (Some(cx), Some(cy)),
+                                None => (None, None),
+                            };
+                            crate::recorder::push(
+                                crate::recorder::KIND_MOUSE_DOWN,
+                                code,
+                                current_modifier_flags(),
+                                x,
+                                y,
+                            );
                         }
                         emit_input(
                             &app,
@@ -530,9 +619,13 @@ pub fn start_global_hooks(app: AppHandle) {
                         );
                     }
                     RawHookMsg::MouseWheel(delta) => {
+                        // 滚轮不入库，只驱动猫咪动画
                         emit_input(&app, InputEvent::MouseWheel { delta });
                     }
                     RawHookMsg::MouseMove { x, y } => {
+                        // 先更新坐标缓存（每条移动都更新，不受下面 62Hz 限流影响），
+                        // 再决定要不要发给前端。
+                        last_cursor = Some((x, y));
                         let now = Instant::now();
                         if now.duration_since(last_mouse_emit) >= Duration::from_millis(16) {
                             last_mouse_emit = now;

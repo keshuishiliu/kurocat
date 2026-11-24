@@ -156,6 +156,12 @@ html.win7-ulw-mode .tail-picker-bar {
   font-weight: 700;
 }
 
+/* 菜单里的「输入统计」状态：记录中给个绿点感 */
+.menu-hint.rec-on {
+  color: #6ee7c8;
+  background: rgba(110, 231, 200, 0.14);
+}
+
 .breed-pills {
   display: grid;
   grid-template-columns: repeat(2, 1fr);

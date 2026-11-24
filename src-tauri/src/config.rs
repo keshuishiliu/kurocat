@@ -30,6 +30,23 @@ fn default_obs_hide_pet() -> bool {
     false
 }
 
+fn default_input_log_active_gap() -> u32 {
+    5
+}
+
+/// 相邻两次输入间隔不超过该分钟数，即视为连续活跃。只影响统计口径，不删除数据。
+pub fn normalize_input_log_active_gap(raw: u32) -> u32 {
+    raw.clamp(1, 120)
+}
+
+/// 保留天数。0 = 永久保留。正值会不可逆地删除更早的数据。
+pub fn normalize_input_log_retention(raw: u32) -> u32 {
+    match raw {
+        0 => 0,
+        d => d.clamp(1, 36500),
+    }
+}
+
 pub fn default_keyboard_layout() -> String {
     if cfg!(feature = "layout-108") {
         "108".to_string()
@@ -139,6 +156,15 @@ pub struct AppSettings {
     pub obs_port: u16,
     #[serde(default = "default_obs_hide_pet")]
     pub obs_hide_pet: bool,
+    // ---- 输入记录（默认关闭；开启后才落盘） ----
+    #[serde(default)]
+    pub input_log_enabled: bool,
+    #[serde(default = "default_input_log_active_gap")]
+    pub input_log_active_gap_minutes: u32,
+    #[serde(default)]
+    pub input_log_retention_days: u32,
+    #[serde(default)]
+    pub input_log_paused: bool,
 }
 
 impl Default for AppSettings {
@@ -167,6 +193,10 @@ impl Default for AppSettings {
             obs_enabled: default_obs_enabled(),
             obs_port: default_obs_port(),
             obs_hide_pet: default_obs_hide_pet(),
+            input_log_enabled: false,
+            input_log_active_gap_minutes: default_input_log_active_gap(),
+            input_log_retention_days: 0,
+            input_log_paused: false,
         }
     }
 }
@@ -208,6 +238,10 @@ pub fn load_settings() -> AppSettings {
             parsed.scale = parsed.scale.clamp(0.20, 1.50);
             parsed.tail_key_mode = normalize_tail_key_mode(&parsed.tail_key_mode);
             parsed.tail_key_ids = normalize_tail_key_ids(&parsed.tail_key_ids);
+            parsed.input_log_active_gap_minutes =
+                normalize_input_log_active_gap(parsed.input_log_active_gap_minutes);
+            parsed.input_log_retention_days =
+                normalize_input_log_retention(parsed.input_log_retention_days);
             return parsed;
         }
     }

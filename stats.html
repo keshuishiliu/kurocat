@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>KuroCat · 输入统计</title>
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-dot" id="rec-dot"></span>
+          <span class="brand-name">KuroCat</span>
+        </div>
+        <div class="brand-sub" id="brand-sub">输入统计</div>
+
+        <nav class="nav">
+          <button class="nav-item active" data-page="dashboard" type="button">仪表盘</button>
+          <button class="nav-item" data-page="stats" type="button">统计</button>
+          <button class="nav-item" data-page="settings" type="button">设置</button>
+        </nav>
+
+        <div class="sidebar-foot" id="sidebar-foot">—</div>
+      </aside>
+
+      <main class="main">
+        <!-- ============ 仪表盘 ============ -->
+        <section class="page active" id="page-dashboard">
+          <div class="page-head">
+            <h1 class="page-title">今天</h1>
+            <span class="page-sub" id="dash-today">—</span>
+          </div>
+
+          <div class="metric-grid">
+            <div class="card">
+              <div class="metric-label">击键</div>
+              <div class="metric-value" id="dash-keys">0</div>
+              <div class="metric-hint" id="dash-keys-hint">一次物理按下算一次</div>
+            </div>
+            <div class="card">
+              <div class="metric-label">鼠标点击</div>
+              <div class="metric-value" id="dash-clicks">0</div>
+              <div class="metric-hint">左 / 右 / 中键按下</div>
+            </div>
+            <div class="card">
+              <div class="metric-label">活跃时长</div>
+              <div class="metric-value" id="dash-active">0<small>分钟</small></div>
+              <div class="metric-hint" id="dash-active-hint">连续操作覆盖的时长</div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="status-card">
+              <div class="status-cell">
+                <div class="status-key">记录状态</div>
+                <div class="status-val"><span class="pill off" id="dash-state">未开启</span></div>
+              </div>
+              <div class="status-cell">
+                <div class="status-key">已用空间</div>
+                <div class="status-val" id="dash-size">—</div>
+              </div>
+              <div class="status-cell">
+                <div class="status-key">最早记录</div>
+                <div class="status-val" id="dash-first">—</div>
+              </div>
+              <div class="status-cell">
+                <div class="status-key">保留期</div>
+                <div class="status-val" id="dash-retention">—</div>
+              </div>
+              <div class="status-cell">
+                <div class="status-key">累计事件</div>
+                <div class="status-val" id="dash-total">—</div>
+              </div>
+              <div class="status-cell">
+                <div class="status-key">月份分表</div>
+                <div class="status-val" id="dash-tables">—</div>
+              </div>
+              <div class="status-cell">
+                <div class="status-key">已识别程序</div>
+                <div class="status-val" id="dash-apps">—</div>
+              </div>
+              <div class="status-cell">
+                <div class="status-key">活跃判定阈值</div>
+                <div class="status-val" id="dash-gap">—</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="note" id="dash-note" hidden></div>
+        </section>
+
+        <!-- ============ 统计 ============ -->
+        <section class="page" id="page-stats">
+          <div class="page-head">
+            <h1 class="page-title">统计</h1>
+            <span class="page-sub">全部来自预聚合表，毫秒级</span>
+          </div>
+
+          <div class="range-row" id="range-row">
+            <button class="chip active" data-range="7" type="button">近 7 天</button>
+            <button class="chip" data-range="30" type="button">近 30 天</button>
+            <button class="chip" data-range="90" type="button">近 90 天</button>
+            <button class="chip" data-range="365" type="button">近一年</button>
+            <button class="chip" data-range="0" type="button">全部</button>
+          </div>
+
+          <div class="chart-grid">
+            <div class="chart-card wide">
+              <div class="chart-title"><span>击键趋势</span><b id="trend-sum">—</b></div>
+              <div class="chart-body" id="chart-trend"><div class="chart-empty">加载中…</div></div>
+            </div>
+
+            <div class="chart-card">
+              <div class="chart-title"><span>一天里的击键分布</span><b id="hour-sum">—</b></div>
+              <div class="chart-body" id="chart-hour"><div class="chart-empty">加载中…</div></div>
+            </div>
+
+            <div class="chart-card">
+              <div class="chart-title"><span>按程序（击键数）</span><b id="app-sum">—</b></div>
+              <div class="chart-body" id="chart-app"><div class="chart-empty">加载中…</div></div>
+            </div>
+
+            <div class="chart-card wide">
+              <div class="chart-title"><span>最常按的键</span><b id="key-sum">—</b></div>
+              <div class="chart-body" id="chart-key"><div class="chart-empty">加载中…</div></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ============ 设置 ============ -->
+        <section class="page" id="page-settings">
+          <div class="page-head">
+            <h1 class="page-title">设置</h1>
+            <span class="page-sub">记录与保留分成两块，互不牵连</span>
+          </div>
+
+          <!-- 卡片 A：记录 -->
+          <div class="settings-card">
+            <div class="settings-card-head">
+              <div class="settings-card-title">记录</div>
+              <div class="settings-card-desc">
+                只记「按下」的瞬间：键盘一次物理按下一条，鼠标左/右/中键各一条并带点击坐标。<br />
+                不记录任何文字内容、窗口标题、剪贴板、鼠标移动与滚轮。
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">记录输入</div>
+                <div class="row-desc">关闭后不再写入任何新记录，已有数据保留不动。</div>
+              </div>
+              <div class="row-ctl">
+                <label class="switch">
+                  <input type="checkbox" id="sw-enabled" />
+                  <span class="switch-track"></span>
+                </label>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">临时暂停</div>
+                <div class="row-desc">只暂停写入，不改动开关状态。适合演示或录屏时临时用。</div>
+              </div>
+              <div class="row-ctl">
+                <label class="switch">
+                  <input type="checkbox" id="sw-paused" />
+                  <span class="switch-track"></span>
+                </label>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">活跃判定阈值</div>
+                <div class="row-desc">
+                  相邻两次输入间隔不超过该时长，这段间隔才算「连续操作」。
+                  调大更宽松，调小只算真正的连续敲击。只影响统计口径，不删任何数据。
+                </div>
+              </div>
+              <div class="row-ctl">
+                <select id="select-gap">
+                  <option value="1">1 分钟</option>
+                  <option value="3">3 分钟</option>
+                  <option value="5">5 分钟</option>
+                  <option value="10">10 分钟</option>
+                  <option value="15">15 分钟</option>
+                  <option value="30">30 分钟</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div class="note">
+            <strong>关于密码：</strong>检测到密码框时会整段停止记录，并把切换前后各 300 毫秒的记录一并丢弃。
+            这是刻意多丢一点，只为不漏掉密码开头的几个字母。
+          </div>
+
+          <!-- 卡片 B：保留期（会删数据，物理隔开） -->
+          <div class="settings-card danger-zone">
+            <div class="settings-card-head">
+              <div class="settings-card-title">保留期</div>
+              <div class="settings-card-desc">
+                这一段会真的删除数据，所以单独放一张卡。<strong>改小立即生效且不可撤销</strong>，
+                改回去也不会恢复已删的记录。
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">当前保留期</div>
+                <div class="row-desc" id="retention-current">—</div>
+              </div>
+              <div class="row-ctl">
+                <span class="status-val mono" id="retention-size">—</span>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">设为</div>
+                <div class="row-desc">选一个预设，或填自定义天数（0 = 永久保留）。</div>
+              </div>
+              <div class="row-ctl" style="flex-wrap: wrap; justify-content: flex-end">
+                <button class="chip" data-days="30" type="button">30 天</button>
+                <button class="chip" data-days="90" type="button">90 天</button>
+                <button class="chip" data-days="180" type="button">180 天</button>
+                <button class="chip" data-days="365" type="button">1 年</button>
+                <button class="chip" data-days="1095" type="button">3 年</button>
+                <button class="chip" data-days="0" type="button">永久</button>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">自定义天数</div>
+                <div class="row-desc">留空或填 0 表示永久保留。</div>
+              </div>
+              <div class="row-ctl">
+                <input type="number" id="input-retention" min="0" max="36500" placeholder="0" />
+                <button class="btn" id="btn-retention-apply" type="button">应用</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 卡片 C：数据操作 -->
+          <div class="settings-card">
+            <div class="settings-card-head">
+              <div class="settings-card-title">数据</div>
+              <div class="settings-card-desc">导出是只读操作；清空不可撤销。</div>
+            </div>
+
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">导出 CSV</div>
+                <div class="row-desc">导出最近 30 天的明细到桌面，键名已还原成可读形式。</div>
+              </div>
+              <div class="row-ctl">
+                <button class="btn" id="btn-export" type="button">导出</button>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">清空全部记录</div>
+                <div class="row-desc">删掉整个 input-log 目录，包括明细与汇总，不留残余。</div>
+              </div>
+              <div class="row-ctl">
+                <button class="btn danger" id="btn-clear" type="button">清空</button>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">数据位置</div>
+                <div class="row-desc mono" id="log-dir">—</div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <!-- 首次开启的告知 -->
+    <div class="modal-mask" id="consent-modal">
+      <div class="modal">
+        <h3>开启输入记录前，先看清楚这些</h3>
+        <p><strong>会记录</strong></p>
+        <ul>
+          <li>键盘每一次物理按下（长按自动重复只算一次）</li>
+          <li>鼠标左/右/中键的按下，以及点击时的屏幕坐标</li>
+          <li>按下时前台程序的进程名，例如 <code>chrome.exe</code></li>
+        </ul>
+        <p><strong>不会记录</strong></p>
+        <ul>
+          <li>任何文字内容、窗口标题、网页地址、剪贴板</li>
+          <li>鼠标移动轨迹与滚轮</li>
+          <li>密码框内的一切（整段跳过，前后各多丢 300 毫秒）</li>
+        </ul>
+        <p>
+          数据只存在本机 <code>input-log</code> 目录，不上传、不联网。
+          当前保留期：<b id="consent-retention">永久</b>。
+        </p>
+        <div class="modal-actions">
+          <button class="btn" id="consent-cancel" type="button">取消</button>
+          <button class="btn primary" id="consent-ok" type="button">明白了，开始记录</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 保留期二次确认 -->
+    <div class="modal-mask" id="retention-modal">
+      <div class="modal">
+        <h3>确认缩短保留期？</h3>
+        <p class="modal-danger" id="retention-warning">—</p>
+        <p>此操作不可撤销。把保留期改回去也不会恢复已删除的记录。</p>
+        <div class="modal-actions">
+          <button class="btn" id="retention-cancel" type="button">取消</button>
+          <button class="btn danger" id="retention-ok" type="button">删除并应用</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 清空二次确认 -->
+    <div class="modal-mask" id="clear-modal">
+      <div class="modal">
+        <h3>清空全部输入记录？</h3>
+        <p class="modal-danger" id="clear-warning">—</p>
+        <p>明细与汇总会一起删除，无法恢复。</p>
+        <div class="modal-actions">
+          <button class="btn" id="clear-cancel" type="button">取消</button>
+          <button class="btn danger" id="clear-ok" type="button">全部删除</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+    <script type="module" src="/src/statsMain.ts"></script>
+  </body>
+</html>

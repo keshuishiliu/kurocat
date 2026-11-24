@@ -25,6 +25,8 @@ interface AppSettings {
   obsEnabled: boolean;
   obsPort: number;
   obsHidePet: boolean;
+  inputLogEnabled?: boolean;
+  inputLogPaused?: boolean;
 }
 
 interface UpdateInfo {
@@ -71,7 +73,7 @@ let settings: AppSettings = {
 
 let catList: CatSkinConfig[] = [...DEFAULT_BUILTIN_CATS];
 let sliderDragging = false;
-let currentAppVersion = '4.9.1';
+let currentAppVersion = '4.10.0';
 
 const menuEl = document.getElementById('context-menu') as HTMLDivElement;
 const breedPillsEl = document.getElementById('breed-pills') as HTMLDivElement;
@@ -136,6 +138,13 @@ function syncUI(): void {
   const obsHint = document.getElementById('obs-copy-hint');
   if (obsHint && !obsHint.classList.contains('copied')) {
     obsHint.textContent = settings.obsEnabled ? `:${settings.obsPort || 27421}` : '免抠像';
+  }
+
+  const statsHint = document.getElementById('stats-hint');
+  if (statsHint) {
+    const recording = Boolean(settings.inputLogEnabled) && !settings.inputLogPaused;
+    statsHint.textContent = recording ? '记录中' : '未开启';
+    statsHint.classList.toggle('rec-on', recording);
   }
 
   if (!sliderDragging) {
@@ -434,6 +443,10 @@ async function bootstrap(): Promise<void> {
         break;
       case 'open-tail-picker':
         void invoke('open_tail_picker_from_menu');
+        break;
+      case 'open-stats':
+        void invoke('open_stats_window');
+        closeMenu();
         break;
       case 'desktop-shortcut':
         void createDesktopShortcut();

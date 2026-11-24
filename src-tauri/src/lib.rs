@@ -8,6 +8,7 @@ mod macos_window;
 mod mcp;
 mod obs;
 mod privacy;
+mod recorder;
 mod tray;
 mod updater;
 #[cfg(windows)]
@@ -20,9 +21,9 @@ const WIN7_OFFSCREEN_PARK_POS: i32 = -16000;
 
 use cats::{all_cats, cat_exists, cats_path, sanitize_cat_id, CatSkinConfig};
 use config::{
-    config_path, load_settings, normalize_keyboard_layout, normalize_keyboard_orientation,
-    normalize_tail_key_ids, normalize_tail_key_mode, save_settings, set_windows_autostart,
-    AppSettings,
+    config_path, load_settings, normalize_input_log_active_gap, normalize_input_log_retention,
+    normalize_keyboard_layout, normalize_keyboard_orientation, normalize_tail_key_ids,
+    normalize_tail_key_mode, save_settings, set_windows_autostart, AppSettings,
 };
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -279,6 +280,18 @@ fn update_settings(app: AppHandle, state: State<'_, AppState>, mut patch: AppSet
     patch.keyboard_orientation = normalize_keyboard_orientation(&patch.keyboard_orientation);
     patch.tail_key_mode = normalize_tail_key_mode(&patch.tail_key_mode);
     patch.tail_key_ids = normalize_tail_key_ids(&patch.tail_key_ids);
+    patch.input_log_active_gap_minutes =
+        normalize_input_log_active_gap(patch.input_log_active_gap_minutes);
+    patch.input_log_retention_days = normalize_input_log_retention(patch.input_log_retention_days);
+    // 隐私约束：保留期只允许改大（或改成永久），改小必须走 input_log_apply_retention 并二次确认。
+    // 否则一次 update_settings 调用就能静默删掉全部历史。
+    {
+        let cur = state.settings.lock().unwrap().input_log_retention_days;
+        let next = patch.input_log_retention_days;
+        if next != cur && next != 0 && (cur == 0 || next < cur) {
+            patch.input_log_retention_days = cur;
+        }
+    }
 
     let (prev_autostart, prev_scale, prev_layout, prev_obs_hide) = {
         let s = state.settings.lock().unwrap();
@@ -336,11 +349,171 @@ fn update_settings(app: AppHandle, state: State<'_, AppState>, mut patch: AppSet
         *s = patch.clone();
         save_settings(&s);
     }
+    // 输入记录开关同步到 recorder 线程。默认关闭，只有用户显式打开才会落盘。
+    recorder::set_enabled(patch.input_log_enabled && !patch.input_log_paused);
+    recorder::set_gap_minutes(patch.input_log_active_gap_minutes);
     let _ = app.emit("kuro-settings", patch.clone());
     if size_changed {
         reposition_context_menu_if_open(&app);
     }
     patch
+}
+
+// ---------------------------------------------------------------------------
+// 输入记录 IPC（统计窗口专用）
+//
+// 安全承诺：这组命令**永远不许出现在 MCP 工具表**里。MCP 与 OBS 都监听
+// 127.0.0.1，一旦它们能调用下面任何一个函数，「改外观的接口」就变成
+// 「导出全部输入历史的接口」。加新工具前先回想这一条。
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn input_log_stats(state: State<'_, AppState>) -> recorder::LogStatus {
+    let (enabled, paused, retention, gap) = {
+        let s = state.settings.lock().unwrap();
+        (
+            s.input_log_enabled,
+            s.input_log_paused,
+            s.input_log_retention_days,
+            s.input_log_active_gap_minutes,
+        )
+    };
+    recorder::status(enabled, paused, retention, gap)
+}
+
+/// 只改三个**不动数据**的字段：开关、暂停、活跃判定阈值。
+/// 保留期不在这里，因为它会删数据，必须走带确认的 `input_log_apply_retention`。
+#[tauri::command]
+fn input_log_configure(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+    paused: bool,
+    gap_minutes: u32,
+) -> recorder::LogStatus {
+    // 一次加锁内完成「读→改→写」，避免与其他窗口的并发设置更新互相覆盖
+    let next = {
+        let mut guard = state.settings.lock().unwrap();
+        guard.input_log_enabled = enabled;
+        guard.input_log_paused = paused;
+        guard.input_log_active_gap_minutes = normalize_input_log_active_gap(gap_minutes);
+        save_settings(&guard);
+        guard.clone()
+    };
+    recorder::set_enabled(enabled && !paused);
+    recorder::set_gap_minutes(next.input_log_active_gap_minutes);
+    let _ = app.emit("kuro-settings", next.clone());
+    recorder::status(
+        next.input_log_enabled,
+        next.input_log_paused,
+        next.input_log_retention_days,
+        next.input_log_active_gap_minutes,
+    )
+}
+
+#[tauri::command]
+fn input_log_summary(
+    from: String,
+    to: String,
+    dim: recorder::SummaryDim,
+) -> Result<Vec<recorder::SummaryPoint>, String> {
+    recorder::summary(&from, &to, dim)
+}
+
+#[tauri::command]
+fn input_log_retention_preview(days: u32) -> Result<recorder::RetentionPreview, String> {
+    recorder::retention_preview(normalize_input_log_retention(days))
+}
+
+/// 执行保留期清理，**不可逆**。调用前必须先用 preview 弹过确认框。
+#[tauri::command]
+fn input_log_apply_retention(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    days: u32,
+) -> Result<recorder::RetentionReport, String> {
+    let days = normalize_input_log_retention(days);
+    let report = recorder::apply_retention(days)?;
+    let snapshot = {
+        let mut guard = state.settings.lock().unwrap();
+        guard.input_log_retention_days = days;
+        save_settings(&guard);
+        guard.clone()
+    };
+    let _ = app.emit("kuro-settings", snapshot);
+    Ok(report)
+}
+
+/// 删掉整个日志目录，不留残余。
+#[tauri::command]
+fn input_log_clear() -> Result<(), String> {
+    recorder::wipe_all()
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InputLogExport {
+    path: String,
+    rows: i64,
+}
+
+#[tauri::command]
+fn input_log_export(days: u32) -> Result<InputLogExport, String> {
+    let days = days.clamp(1, 36_500);
+    let to_ts = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let from_ts = to_ts - days as i64 * 86_400_000;
+    let path = export_target_path();
+    let rows = recorder::export_csv(from_ts, to_ts, &path)?;
+    Ok(InputLogExport {
+        path: path.to_string_lossy().to_string(),
+        rows,
+    })
+}
+
+fn export_target_path() -> std::path::PathBuf {
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let name = format!("kurocat-input-{stamp}.csv");
+    if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+        let desktop = std::path::PathBuf::from(home).join("Desktop");
+        if desktop.is_dir() {
+            return desktop.join(name);
+        }
+    }
+    config::app_data_dir().join(name)
+}
+
+/// 打开统计窗口。必须是 `async fn`，否则在同步命令里 build 会死锁 Windows 事件循环
+/// （同 `open_context_menu` 的注释）。
+#[tauri::command]
+async fn open_stats_window(app: AppHandle) -> Result<(), String> {
+    if let Some(existing) = app.get_webview_window("stats") {
+        let _ = existing.show();
+        let _ = existing.unminimize();
+        let _ = existing.set_focus();
+        return Ok(());
+    }
+    let created = tauri::WebviewWindowBuilder::new(
+        &app,
+        "stats",
+        tauri::WebviewUrl::App("stats.html".into()),
+    )
+    .title("KuroCat · 输入统计")
+    .inner_size(1000.0, 720.0)
+    .min_inner_size(880.0, 620.0)
+    .decorations(true)
+    .resizable(true)
+    .always_on_top(false)
+    .skip_taskbar(false)
+    .center()
+    // 必须与主窗口一致，否则 WebView2 在同一个 userDataFolder 下拒绝创建第二个窗口
+    .additional_browser_args("--autoplay-policy=no-user-gesture-required")
+    .build()
+    .map_err(|e| format!("创建统计窗口失败: {e}"))?;
+    let _ = created.set_focus();
+    Ok(())
 }
 
 const SIDE_MENU_LOGICAL_W: f64 = 266.0;
@@ -722,6 +895,8 @@ fn create_desktop_shortcut() -> Result<String, String> {
 
 #[tauri::command]
 fn quit_app(app: AppHandle) {
+    // 先刷盘再退出，保证「正常退出丢 0 条」
+    recorder::shutdown();
     shutdown_pet_windows();
     app.exit(0);
 }
@@ -2028,6 +2203,26 @@ pub fn run() {
             }
 
             tray::setup_tray(&handle, &s)?;
+            // 输入记录器：默认关闭，只有 settings 里显式打开才会落盘
+            recorder::init(
+                s.input_log_enabled && !s.input_log_paused,
+                s.input_log_active_gap_minutes,
+            );
+            if s.input_log_enabled && s.input_log_retention_days > 0 {
+                let retention_handle = handle.clone();
+                let days = s.input_log_retention_days;
+                std::thread::spawn(move || {
+                    // 等启动流程稳定后再做可能耗时几秒的清理
+                    std::thread::sleep(Duration::from_secs(3));
+                    match recorder::apply_retention(days) {
+                        Ok(r) if r.deleted_rows > 0 => {
+                            let _ = retention_handle.emit("kuro-input-log-cleaned", r);
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!("[recorder] 启动清理失败: {e}"),
+                    }
+                });
+            }
             input_hook::start_global_hooks(handle.clone());
             privacy::start_password_privacy_watcher(
                 handle.clone(),
@@ -2124,9 +2319,23 @@ pub fn run() {
             install_update,
             open_release_page,
             quit_app,
+            input_log_stats,
+            input_log_configure,
+            input_log_summary,
+            input_log_retention_preview,
+            input_log_apply_retention,
+            input_log_clear,
+            input_log_export,
+            open_stats_window,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running KuroCat");
+        .build(tauri::generate_context!())
+        .expect("error while building KuroCat")
+        .run(|_app, event| {
+            // 正常退出：把缓冲里未提交的记录刷盘，做到「正常退出丢 0 条」
+            if let tauri::RunEvent::Exit = event {
+                recorder::shutdown();
+            }
+        });
 }
 
 #[cfg(all(test, windows))]

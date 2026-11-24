@@ -11,6 +11,7 @@ export default defineConfig({
         main: path.resolve(__dirname, 'index.html'),
         menu: path.resolve(__dirname, 'menu.html'),
         obs: path.resolve(__dirname, 'obs.html'),
+        stats: path.resolve(__dirname, 'stats.html'),
       },
     },
   },

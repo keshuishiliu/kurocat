@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Default capabilities for KuroCat Pet",
-  "windows": ["main", "menu"],
+  "windows": ["main", "menu", "stats"],
   "permissions": [
     "core:default",
     "core:event:default",
@@ -14,6 +14,9 @@
     "core:window:allow-set-ignore-cursor-events",
     "core:window:allow-show",
     "core:window:allow-hide",
-    "core:window:allow-close"
+    "core:window:allow-close",
+    "core:window:allow-minimize",
+    "core:window:allow-unminimize",
+    "core:window:allow-set-focus"
   ]
 }
