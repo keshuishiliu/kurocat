@@ -87,7 +87,7 @@ let settings: AppSettings = {
 
 let catList: CatSkinConfig[] = [...DEFAULT_BUILTIN_CATS];
 let sliderDragging = false;
-let currentAppVersion = '4.14.0';
+let currentAppVersion = '4.15.0';
 
 // 更新流程状态：菜单窗口与宠物窗口共用 Rust 侧同一套 install_update 管线。
 let updateBusy = false;
