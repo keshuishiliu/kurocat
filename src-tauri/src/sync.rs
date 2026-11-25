@@ -543,15 +543,21 @@ impl Dav {
             return Err(format!("列出 {path} 失败（HTTP {status}）"));
         }
         let text = resp.text().map_err(|e| e.to_string())?;
-        Ok(parse_propfind_hrefs(&text)
+        // 排除被列目录自身那一行：坚果云对目录也回 response，basename 与请求路径相同
+        let self_name = path
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        Ok(parse_propfind_entries(&text)
             .into_iter()
-            .filter_map(|href| {
+            .filter_map(|(href, is_dir)| {
                 let decoded = percent_decode(&href);
-                let is_dir = decoded.ends_with('/');
                 let name = decoded.trim_end_matches('/');
                 let name = name.rsplit('/').next()?.to_string();
-                if name.is_empty() {
-                    return None; // 目录本身那一行
+                if name.is_empty() || name == self_name {
+                    return None; // 空名或被列目录本身
                 }
                 Some(DavEntry { name, is_dir })
             })
@@ -559,27 +565,61 @@ impl Dav {
     }
 }
 
-/// 从 multistatus XML 里抠出所有 href。不引 XML 库：命名空间前缀五花八门，
-/// 唯一稳定的是 `<任意前缀:href>…</任意前缀:href>` 这个形状。
-/// 闭合标签（`</d:href>`）里同样含 ":href"，靠前一个字符是不是 `/` 排除。
-fn parse_propfind_hrefs(body: &str) -> Vec<String> {
+/// 把 multistatus 按 `<…:response>` 块切分，逐块给出 (href, is_dir)。
+///
+/// 坚果云的目录 href **不带尾部斜杠**（Apache/mod_dav 这类标准实现才带），
+/// 靠斜杠判断目录会把对方机器目录全判成文件——同步导入因此整段静默跳过过。
+/// 目录的可靠判据是块内 `<d:collection/>`（命名空间前缀任意）；斜杠启发仍保留兜底。
+fn parse_propfind_entries(body: &str) -> Vec<(String, bool)> {
     let lower = body.to_lowercase();
+    const NEEDLE: &str = ":response>";
     let mut out = Vec::new();
-    let mut pos = 0usize;
-    while let Some(rel) = lower[pos..].find(":href") {
-        let start = pos + rel;
-        // 排除闭合标签：":href" 前第二个字符是 '/' 即 `</d:href>`
-        if start >= 2 && body.as_bytes()[start - 2] == b'/' {
-            pos = start + 5;
+    let mut i = 0usize;
+    while let Some(rel) = lower[i..].find(NEEDLE) {
+        let open = i + rel;
+        // 排除闭合标签：":response>" 前第二个字符是 '/' 即 `</d:response>`
+        if open >= 2 && body.as_bytes()[open - 2] == b'/' {
+            i = open + NEEDLE.len();
             continue;
         }
-        let Some(gt_rel) = body[start..].find('>') else { break };
-        let val_start = start + gt_rel + 1;
-        let Some(lt_rel) = body[val_start..].find('<') else { break };
-        out.push(body[val_start..val_start + lt_rel].to_string());
-        pos = val_start + lt_rel;
+        let content_start = open + NEEDLE.len();
+        // 块终点：下一个闭合标签的位置；没有就当作到文档末尾
+        let close = lower[content_start..]
+            .match_indices(NEEDLE)
+            .find(|(p, _)| {
+                let abs = content_start + p;
+                abs >= 2 && body.as_bytes()[abs - 2] == b'/'
+            })
+            .map(|(p, _)| content_start + p)
+            .unwrap_or(lower.len());
+        let block = &body[content_start..close];
+        let block_lower = &lower[content_start..close];
+        if let Some(href) = first_href_value(block, block_lower) {
+            let is_dir = block_lower.contains(":collection") || href.ends_with('/');
+            out.push((href, is_dir));
+        }
+        i = close;
     }
     out
+}
+
+/// 片段内第一个**开标签** href 的值。闭合标签 `</d:href>` 同样含 ":href"，
+/// 靠前一个字符是不是 '/' 排除（与块的切分逻辑同一套路）。
+fn first_href_value(block: &str, block_lower: &str) -> Option<String> {
+    const NEEDLE: &str = ":href";
+    let mut pos = 0usize;
+    while let Some(rel) = block_lower[pos..].find(NEEDLE) {
+        let start = pos + rel;
+        if start >= 2 && block.as_bytes()[start - 2] == b'/' {
+            pos = start + NEEDLE.len();
+            continue;
+        }
+        let Some(gt_rel) = block[start..].find('>') else { return None };
+        let val_start = start + gt_rel + 1;
+        let Some(lt_rel) = block[val_start..].find('<') else { return None };
+        return Some(block[val_start..val_start + lt_rel].to_string());
+    }
+    None
 }
 
 fn percent_decode(s: &str) -> String {
@@ -1806,13 +1846,37 @@ mod tests {
     fn propfind_parse_handles_namespaces_and_closing_tags() {
         let xml = r#"<?xml version="1.0"?>
 <D:multistatus xmlns:D="DAV:">
-  <D:response><D:href>/dav/KuroCatSync/</D:href></D:response>
-  <D:response><D:href>/dav/KuroCatSync/abcd1234/</D:href></D:response>
-  <D:response><D:href>/dav/KuroCatSync/abcd1234/0001234567890_000001_abcd1234.json</D:href></D:response>
+  <D:response><D:href>/dav/KuroCatSync/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop></D:propstat></D:response>
+  <D:response><D:href>/dav/KuroCatSync/abcd1234/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop></D:propstat></D:response>
+  <D:response><D:href>/dav/KuroCatSync/abcd1234/0001234567890_000001_abcd1234.json</D:href><D:propstat><D:prop><D:resourcetype/></D:prop></D:propstat></D:response>
 </D:multistatus>"#;
-        let hrefs = parse_propfind_hrefs(xml);
-        assert_eq!(hrefs.len(), 3, "闭合标签不应被当成值：{}", hrefs.len());
-        assert!(hrefs[0].ends_with('/'));
+        let entries = parse_propfind_entries(xml);
+        assert_eq!(entries.len(), 3, "闭合标签不应被当成值：{:?}", entries);
+        assert!(entries[0].1, "带尾斜杠 + collection 应判为目录");
+        assert!(entries[1].1);
+        assert!(!entries[2].1, "文件不应判为目录");
+    }
+
+    /// 回归：坚果云的目录 href 不带尾部斜杠，只有块内 <d:collection/>
+    /// 能证明它是目录。曾因只看斜杠把对方机器目录全判成文件，
+    /// 导入整段静默跳过。
+    #[test]
+    fn propfind_parse_jianguoyun_dirs_without_trailing_slash() {
+        let xml = concat!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="no"?>"#,
+            r#"<d:multistatus xmlns:d="DAV:" xmlns:s="http://ns.jianguoyun.com">"#,
+            r#"<d:response><d:href>/dav/KuroCatSync/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype><d:getlastmodified>Wed, 25 Nov 2026 05:52:24 GMT</d:getlastmodified></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"#,
+            r#"<d:response><d:href>/dav/KuroCatSync/104ba10907eda975</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"#,
+            r#"<d:response><d:href>/dav/KuroCatSync/104ba10907eda975/1795585699413_000001_104ba10907eda975.json</d:href><d:propstat><d:prop><d:resourcetype/><d:getcontentlength>703052</d:getcontentlength></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"#,
+            r#"</d:multistatus>"#,
+        );
+        let entries = parse_propfind_entries(xml);
+        let got: Vec<(String, bool)> = entries;
+        assert_eq!(got.len(), 3, "{got:?}");
+        // 坚果云式无尾斜杠目录：必须靠 collection 标签判出 is_dir
+        assert_eq!(got[1].0, "/dav/KuroCatSync/104ba10907eda975");
+        assert!(got[1].1, "坚果云目录（无尾斜杠）必须判为目录");
+        assert!(!got[2].1, "json 包是文件");
     }
 
     #[test]
