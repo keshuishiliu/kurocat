@@ -109,32 +109,39 @@
           </div>
 
           <div class="range-row" id="range-row">
-            <button class="chip active" data-range="7" type="button">近 7 天</button>
+            <button class="chip active" data-range="1" type="button">今日</button>
+            <button class="chip" data-range="7" type="button">近 7 天</button>
             <button class="chip" data-range="30" type="button">近 30 天</button>
             <button class="chip" data-range="90" type="button">近 90 天</button>
             <button class="chip" data-range="365" type="button">近一年</button>
             <button class="chip" data-range="0" type="button">全部</button>
+            <span class="range-sep">自定义</span>
+            <input type="date" id="input-from" title="开始日期" />
+            <span class="range-sep">至</span>
+            <input type="date" id="input-to" title="结束日期" />
           </div>
 
           <div class="chart-grid">
             <div class="chart-card wide">
               <div class="chart-title"><span>击键趋势</span><b id="trend-sum">—</b></div>
+              <div class="chart-legend" id="legend-trend"></div>
               <div class="chart-body" id="chart-trend"><div class="chart-empty">加载中…</div></div>
             </div>
 
             <div class="chart-card wide">
               <div class="chart-title"><span>一天里的击键分布</span><b id="hour-sum">—</b></div>
+              <div class="chart-legend" id="legend-hour"></div>
               <div class="chart-body" id="chart-hour"><div class="chart-empty">加载中…</div></div>
             </div>
 
             <div class="chart-card wide">
               <div class="chart-title"><span>按程序（击键数）</span><b id="app-sum">—</b></div>
-              <div class="chart-body" id="chart-app"><div class="chart-empty">加载中…</div></div>
+              <div class="chart-body chart-scroll" id="chart-app"><div class="chart-empty">加载中…</div></div>
             </div>
 
             <div class="chart-card wide">
               <div class="chart-title"><span>按程序（前台时长 · 分钟）</span><b id="focus-sum">—</b></div>
-              <div class="chart-body" id="chart-focus"><div class="chart-empty">加载中…</div></div>
+              <div class="chart-body chart-scroll" id="chart-focus"><div class="chart-empty">加载中…</div></div>
             </div>
 
             <div class="chart-card">
@@ -144,7 +151,8 @@
 
             <div class="chart-card">
               <div class="chart-title"><span>最常按的键</span><b id="key-sum">—</b></div>
-              <div class="chart-body" id="chart-key"><div class="chart-empty">加载中…</div></div>
+              <div class="chart-legend" id="legend-key"></div>
+              <div class="chart-body chart-scroll" id="chart-key"><div class="chart-empty">加载中…</div></div>
             </div>
           </div>
 
@@ -746,7 +754,8 @@
           <div class="app-stats-head">
             <div class="field-label">使用统计</div>
             <div class="range-row" id="app-stats-range">
-              <button class="chip active" data-range="7" type="button">近 7 天</button>
+              <button class="chip active" data-range="1" type="button">今日</button>
+              <button class="chip" data-range="7" type="button">近 7 天</button>
               <button class="chip" data-range="30" type="button">近 30 天</button>
               <button class="chip" data-range="0" type="button">全部</button>
             </div>

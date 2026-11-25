@@ -1877,7 +1877,7 @@ dependencies = [
 
 [[package]]
 name = "kuro-cat-pet"
-version = "4.15.2"
+version = "4.16.0"
 dependencies = [
  "block2",
  "chrono",

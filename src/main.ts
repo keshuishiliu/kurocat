@@ -78,7 +78,7 @@ interface PendingPortableUpdate {
   sha256: string | null;
 }
 
-let appVersion = '4.15.2';
+let appVersion = '4.16.0';
 let latestUpdateInfo: UpdateInfo | null = null;
 let updateBusy = false;
 let dismissedVersion: string | null = null;

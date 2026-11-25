@@ -375,10 +375,62 @@ body {
   min-height: 150px;
 }
 
+/* 榜单全量展示：超高清滚动，不截前几名 */
+.chart-body.chart-scroll {
+  max-height: 420px;
+  overflow-y: auto;
+  border-radius: 6px;
+}
+
 .chart-body svg {
   display: block;
   width: 100%;
   height: auto;
+}
+
+/* 分类色图例（趋势 / 分布 / 常按的键的分段说明） */
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  font-size: 11px;
+  color: var(--muted);
+  margin: -4px 0 8px;
+}
+
+.chart-legend:empty {
+  display: none;
+}
+
+.chart-legend .lg-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.chart-legend .lg-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  flex: none;
+}
+
+/* 图表悬浮数值提示（statsChart.ts 动态创建，挂在 body 上） */
+.chart-tip {
+  position: fixed;
+  z-index: 9999;
+  pointer-events: none;
+  background: var(--panel-2);
+  border: 1px solid var(--line-strong);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.6;
+  padding: 5px 9px;
+  border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+  white-space: pre-line;
+  opacity: 0;
+  transition: opacity 0.08s;
 }
 
 .chart-empty {
@@ -395,6 +447,20 @@ body {
   gap: 6px;
   margin-bottom: 14px;
   flex-wrap: wrap;
+}
+
+/* 「自定义 / 至」分隔文字与日期输入框的对齐 */
+.range-sep {
+  align-self: center;
+  font-size: 11px;
+  color: var(--faint);
+  margin: 0 2px;
+}
+
+.range-row input[type="date"] {
+  width: 128px;
+  padding: 4px 8px;
+  font-size: 12px;
 }
 
 .chip {
@@ -567,6 +633,7 @@ select,
 input[type="text"],
 input[type="password"],
 input[type="number"],
+input[type="date"],
 input[type="datetime-local"] {
   appearance: none;
   background: var(--panel-2);

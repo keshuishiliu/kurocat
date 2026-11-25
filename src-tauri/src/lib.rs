@@ -525,6 +525,24 @@ fn input_log_summary(
     recorder::summary(&from, &to, dim)
 }
 
+/// 按分类聚合（趋势 / 分布 / 常按的键三张图的分类拼接）。
+#[tauri::command]
+fn input_log_category_summary(
+    state: State<'_, AppState>,
+    from: String,
+    to: String,
+) -> Result<recorder::CategorySummary, String> {
+    let cat_by_process: std::collections::HashMap<String, String> = state
+        .settings
+        .lock()
+        .unwrap()
+        .app_categories
+        .clone()
+        .into_iter()
+        .collect();
+    recorder::category_summary(&from, &to, &cat_by_process)
+}
+
 /// 单个应用的统计（键鼠汇总、按日趋势、前台热力图、top 按键）。
 #[tauri::command]
 fn input_log_app_stats(
@@ -2694,6 +2712,7 @@ pub fn run() {
             input_log_stats,
             input_log_configure,
             input_log_summary,
+            input_log_category_summary,
             app_meta_get,
             input_log_app_activity,
             open_path_folder,

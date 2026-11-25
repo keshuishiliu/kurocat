@@ -17,6 +17,7 @@ import {
   categoryForApp,
   createCategory,
   deleteCategory,
+  findCategory,
   init as initCategories,
   listCategories,
   rollupByCategory,
@@ -65,6 +66,20 @@ interface SummaryPoint {
   mousedown: number;
   activeSeconds: number;
   focusSeconds: number;
+}
+
+/** 分类聚合的一行（对应 recorder.rs 的 CatRow）。cat 为空串 = 未归类。 */
+interface CatRow {
+  label: string;
+  cat: string;
+  n: number;
+}
+
+/** 分类聚合结果（对应 recorder.rs 的 CategorySummary）。hours/keys 范围 > 31 天时为空。 */
+interface CategorySummary {
+  days: CatRow[];
+  hours: CatRow[];
+  keys: CatRow[];
 }
 
 /**
@@ -205,7 +220,7 @@ const DEMO_APP_META: Record<string, { name: string; version: string; path: strin
   },
   'kurocat.exe': {
     name: 'Kuro 猫猫宠',
-    version: '4.15.2',
+    version: '4.16.0',
     path: 'D:\\Programs\\kurocat\\KuroCat.exe',
   },
   'windowsterminal.exe': {
@@ -427,6 +442,8 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
       return demoStatus() as unknown as T;
     case 'input_log_summary':
       return demoSummary(String(args?.dim ?? 'day')) as unknown as T;
+    case 'input_log_category_summary':
+      return { days: [], hours: [], keys: [] } as unknown as T;
     case 'input_log_retention_preview':
       return { cutoffDay: '2026-08-26', cutoffTs: 0, rows: 1_284_392, months: ['202609'] } as unknown as T;
     case 'input_log_apply_retention':
@@ -492,7 +509,10 @@ function $<T extends HTMLElement>(id: string): T {
 }
 
 let status: LogStatus | null = null;
-let currentRange = 7;
+let currentRange = 1;
+/** 自定义起止日期（date input 的值）。任一为空表示未启用自定义区间。 */
+let customFrom = '';
+let customTo = '';
 let pendingRetentionDays: number | null = null;
 let toastTimer = 0;
 let allApps: SummaryPoint[] = [];
@@ -500,7 +520,7 @@ let appFilter = '';
 /** 分类筛选 chip：'all' = 全部，其余为顶层分类 id（含内置「未分类」）。 */
 let appCatChip = 'all';
 /** 详情弹窗统计的时间范围（天数；0 = 全部）。 */
-let appStatsRange = 7;
+let appStatsRange = 1;
 /** 快速换类下拉当前挂着的程序进程名；null = 收起。 */
 let quickDropApp: string | null = null;
 /** 进程名（小写）→ 图标 / 中文名 / 路径 / 版本 */
@@ -694,7 +714,10 @@ function renderStatus(st: LogStatus): void {
   ($('input-retention') as HTMLInputElement).value = st.retentionDays === 0 ? '' : String(st.retentionDays);
   $('consent-retention').textContent = st.retentionDays === 0 ? '永久' : `${st.retentionDays} 天`;
   document.querySelectorAll<HTMLButtonElement>('#range-row .chip').forEach((btn) => {
-    btn.classList.toggle('active', Number(btn.dataset.range) === currentRange);
+    btn.classList.toggle(
+      'active',
+      !customFrom && !customTo && Number(btn.dataset.range) === currentRange,
+    );
   });
   updateTrailAvailability();
 }
@@ -717,33 +740,48 @@ function sumOf(rows: SummaryPoint[]): number {
 }
 
 async function loadStats(): Promise<void> {
-  const to = dayStr(new Date());
-  const dim: SummaryDim = currentRange > 0 && currentRange <= 92 ? 'day' : 'month';
+  // 自定义区间优先；起止颠倒自动交换
+  const hasCustom = Boolean(customFrom && customTo);
+  const to = hasCustom ? (customFrom <= customTo ? customTo : customFrom) : dayStr(new Date());
   let from: string;
-  if (currentRange === 0) {
+  if (hasCustom) {
+    from = customFrom <= customTo ? customFrom : customTo;
+  } else if (currentRange === 0) {
     from = status?.firstDay ?? to;
   } else {
     from = daysAgoInclusive(currentRange);
   }
+  const dim: SummaryDim = spanDays(from, to) > 92 ? 'month' : 'day';
 
-  const [trendRaw, hoursRaw, appsRaw, keysRaw] = await Promise.all([
+  const [trendRaw, hoursRaw, appsRaw, keysRaw, catsRaw] = await Promise.all([
     guard(() => call<SummaryPoint[]>('input_log_summary', { from, to, dim })),
     guard(() => call<SummaryPoint[]>('input_log_summary', { from, to, dim: 'hour' })),
     guard(() => call<SummaryPoint[]>('input_log_summary', { from, to, dim: 'app' })),
     guard(() => call<SummaryPoint[]>('input_log_summary', { from, to, dim: 'key' })),
+    guard(() => call<CategorySummary>('input_log_category_summary', { from, to })),
   ]);
   const trend = trendRaw ?? [];
   const hours = hoursRaw ?? [];
   const apps = appsRaw ?? [];
   const keys = keysRaw ?? [];
+  const cats = catsRaw ?? { days: [], hours: [], keys: [] };
   // 忽略的程序不进统计口径：新数据本来就不会再产生，历史数据也一并隐藏
   // （明细保留在库里，取消忽略即可恢复显示）。
   const appsVisible = apps.filter((r) => !isIgnored(r.label));
 
-  const trendPoints: Point[] = trend.map((r) => ({
-    label: shortLabel(r.label, dim),
-    value: r.keydown,
-  }));
+  // ---- 趋势：按分类拼接（daily_apps 聚合，任何范围都便宜） ----
+  const trendOrder = catOrderOf(cats.days);
+  const dayMap = catMapOf(cats.days, dim);
+  const trendPoints: Point[] = trend.map((r) => {
+    const inner = dayMap.get(r.label);
+    const segs = inner
+      ? trendOrder
+          .map((c) => ({ v: inner.get(c.id) ?? 0, c: c.color, name: c.name }))
+          .filter((s) => s.v > 0)
+      : undefined;
+    return { label: shortLabel(r.label, dim), value: r.keydown, segs };
+  });
+  renderLegend('legend-trend', trendOrder);
   const trendHost = $('chart-trend');
   if (trendPoints.length > 20) {
     renderLine(trendHost, trendPoints, { height: 200, maxLabels: 9 });
@@ -752,22 +790,30 @@ async function loadStats(): Promise<void> {
   }
   $('trend-sum').textContent = trendPoints.length ? `${fmtNum(sumOf(trend))} 次` : '—';
 
+  // ---- 分布：分类拼接只在后端扫得动 events 明细时有（范围 ≤ 31 天），否则退回纯色 ----
+  const hourOrder = catOrderOf(cats.hours);
+  const hourMap = catMapOf(cats.hours, 'day');
+  const hourPoints: Point[] = hours.map((r) => {
+    const inner = hourMap.get(r.label);
+    const segs = inner
+      ? hourOrder
+          .map((c) => ({ v: inner.get(c.id) ?? 0, c: c.color, name: c.name }))
+          .filter((s) => s.v > 0)
+      : undefined;
+    return { label: r.label, value: r.keydown, segs };
+  });
+  renderLegend('legend-hour', hourOrder);
   // 整行宽之后 24 个小时桶每格有二十多像素，标签可以按小时一格给，不用再抽稀
-  renderBars(
-    $('chart-hour'),
-    hours.map((r) => ({ label: r.label, value: r.keydown })),
-    { height: 168, maxLabels: 24 },
-  );
+  renderBars($('chart-hour'), hourPoints, { height: 168, maxLabels: 24 });
   $('hour-sum').textContent = hours.length ? `${fmtNum(sumOf(hours))} 次` : '—';
 
-  // 按程序排行：先用进程名出一版骨架，中文显示名与图标解析完再重画
-  const appRows = appsVisible.filter((r) => r.keydown > 0).slice(0, 10);
+  // ---- 按程序排行：全量展示，容器滚动 ----
+  const appRows = appsVisible.filter((r) => r.keydown > 0);
   // 前台时长排行：与击键排行是两回事——看视频、读文档的程序一个键都不按，
   // 但会在这里排在前面。排序必须自己重排，不能沿用后端按「按键 + 时长」的混合序。
   const focusRows = appsVisible
     .filter((r) => r.focusSeconds > 0)
-    .sort((a, b) => b.focusSeconds - a.focusSeconds)
-    .slice(0, 10);
+    .sort((a, b) => b.focusSeconds - a.focusSeconds);
   const renderAppCharts = () => {
     renderHBars(
       $('chart-app'),
@@ -781,7 +827,7 @@ async function loadStats(): Promise<void> {
     );
   };
   renderAppCharts();
-  $('app-sum').textContent = appRows.length ? `前 ${appRows.length}` : '—';
+  $('app-sum').textContent = appRows.length ? `${appRows.length} 个程序` : '—';
   if (await ensureAppMetas(appsVisible.map((r) => r.label))) {
     renderAppCharts();
   }
@@ -811,12 +857,71 @@ async function loadStats(): Promise<void> {
     noteEl.hidden = true;
   }
 
-  const keyPoints: Point[] = keys
-    .filter((r) => r.keydown > 0)
-    .slice(0, 15)
-    .map((r) => ({ label: r.label, value: r.keydown }));
+  // ---- 最常按的键：按分类拼接（events 聚合，≤ 31 天时有），全量滚动 ----
+  let keyOrder: Array<{ id: string; name: string; color: string }> = [];
+  let keyPoints: Point[];
+  if (cats.keys.length) {
+    keyOrder = catOrderOf(cats.keys);
+    const km = catMapOf(cats.keys, 'day');
+    keyPoints = [...km.entries()]
+      .map(([label, inner]) => ({
+        label,
+        value: [...inner.values()].reduce((a, b) => a + b, 0),
+        segs: keyOrder
+          .map((c) => ({ v: inner.get(c.id) ?? 0, c: c.color, name: c.name }))
+          .filter((s) => s.v > 0),
+      }))
+      .sort((a, b) => b.value - a.value);
+  } else {
+    keyPoints = keys.filter((r) => r.keydown > 0).map((r) => ({ label: r.label, value: r.keydown }));
+  }
+  renderLegend('legend-key', keyOrder);
   renderHBars($('chart-key'), keyPoints, { labelWidth: 96 });
-  $('key-sum').textContent = keyPoints.length ? `前 ${keyPoints.length}` : '—';
+  $('key-sum').textContent = keyPoints.length ? `${keyPoints.length} 种按键` : '—';
+}
+
+/** 分类分段顺序：按总次数降序，颜色跨柱一致。 */
+function catOrderOf(rows: CatRow[]): Array<{ id: string; name: string; color: string }> {
+  const totals = new Map<string, number>();
+  for (const r of rows) totals.set(r.cat, (totals.get(r.cat) ?? 0) + r.n);
+  return [...totals.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([id]) => {
+      const c = findCategory(id || 'uncat');
+      return { id, name: c?.name ?? '未分类', color: c?.color ?? '#8b909c' };
+    });
+}
+
+/** label → (分类 id → n)。dim='month' 时天标签折叠成月。 */
+function catMapOf(rows: CatRow[], dim: SummaryDim): Map<string, Map<string, number>> {
+  const out = new Map<string, Map<string, number>>();
+  for (const r of rows) {
+    const label = dim === 'month' ? r.label.slice(0, 7) : r.label;
+    let inner = out.get(label);
+    if (!inner) {
+      inner = new Map();
+      out.set(label, inner);
+    }
+    inner.set(r.cat, (inner.get(r.cat) ?? 0) + r.n);
+  }
+  return out;
+}
+
+/** 图例：分类色点 + 名称。空数组时隐藏容器。 */
+function renderLegend(id: string, order: Array<{ name: string; color: string }>): void {
+  $(id).innerHTML = order
+    .map(
+      (c) =>
+        `<span class="lg-item"><i class="lg-dot" style="background:${c.color}"></i>${escapeHtml(c.name)}</span>`,
+    )
+    .join('');
+}
+
+/** 两个 YYYY-MM-DD 之间的天数差。 */
+function spanDays(from: string, to: string): number {
+  const f = new Date(`${from}T00:00:00`);
+  const t = new Date(`${to}T00:00:00`);
+  return Math.round((t.getTime() - f.getTime()) / 86_400_000);
 }
 
 // ---------------------------------------------------------------- 分类
@@ -1618,11 +1723,29 @@ function bindEvents(): void {
     const btn = (ev.target as HTMLElement).closest<HTMLButtonElement>('.chip');
     if (!btn?.dataset.range) return;
     currentRange = Number(btn.dataset.range);
+    // 点快捷 chip 即退出自定义区间
+    customFrom = '';
+    customTo = '';
+    ($('input-from') as HTMLInputElement).value = '';
+    ($('input-to') as HTMLInputElement).value = '';
     document.querySelectorAll<HTMLButtonElement>('#range-row .chip').forEach((c) => {
       c.classList.toggle('active', c === btn);
     });
     void loadStats();
   });
+
+  // 自定义起止日期：两个都填了才生效
+  const applyCustomRange = () => {
+    customFrom = ($('input-from') as HTMLInputElement).value;
+    customTo = ($('input-to') as HTMLInputElement).value;
+    if (!customFrom || !customTo) return;
+    document.querySelectorAll<HTMLButtonElement>('#range-row .chip').forEach((c) => {
+      c.classList.remove('active');
+    });
+    void loadStats();
+  };
+  $('input-from').addEventListener('change', applyCustomRange);
+  $('input-to').addEventListener('change', applyCustomRange);
 
   document.querySelectorAll<HTMLButtonElement>('[data-days]').forEach((btn) => {
     btn.addEventListener('click', () => {

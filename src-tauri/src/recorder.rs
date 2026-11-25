@@ -119,12 +119,15 @@ CREATE TABLE IF NOT EXISTS imported_packs (
 ) WITHOUT ROWID;
 -- 每个来源机器、每个统计键上次导入时的取值。导入时只应用「本次值 − 上次值」的
 -- 差值，所以同一个包重复导入、甚至登记表整个丢失，计数也不会翻倍。
+-- applied 记录该键**累计已入账的导入量**：导出时用「表值 − Σ applied」剔除
+-- 导入贡献，防止「甲导入乙的数据 → 甲导出时又把它当自己的发给乙」的回声翻倍。
 -- gkey 里的应用维度用进程名而不是对方库的 app_id：对方清空重建后 id 会变，
 -- 进程名才是跨机器稳定的身份。
 CREATE TABLE IF NOT EXISTS merge_state (
     source_id TEXT    NOT NULL,
     gkey      TEXT    NOT NULL,
     last_n    INTEGER NOT NULL,
+    applied   INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (source_id, gkey)
 ) WITHOUT ROWID;
 "#;
@@ -1445,7 +1448,7 @@ pub fn summary(from_day: &str, to_day: &str, dim: SummaryDim) -> Result<Vec<Summ
                      LEFT JOIN agg_keys k ON k.app_id = ids.app_id \
                      LEFT JOIN agg_focus f ON f.app_id = ids.app_id \
                      LEFT JOIN apps a ON a.id = ids.app_id \
-                     ORDER BY (COALESCE(k.kd, 0) + COALESCE(f.fsec, 0)) DESC LIMIT 60",
+                     ORDER BY (COALESCE(k.kd, 0) + COALESCE(f.fsec, 0)) DESC LIMIT 500",
                 )
                 .map_err(|e| e.to_string())?;
             let rows = stmt
@@ -1466,7 +1469,7 @@ pub fn summary(from_day: &str, to_day: &str, dim: SummaryDim) -> Result<Vec<Summ
                 .prepare(
                     "SELECT code, SUM(n) FROM daily_stats \
                      WHERE kind = 0 AND day >= ?1 AND day <= ?2 \
-                     GROUP BY code ORDER BY 2 DESC LIMIT 40",
+                     GROUP BY code ORDER BY 2 DESC LIMIT 200",
                 )
                 .map_err(|e| e.to_string())?;
             let rows = stmt
@@ -1485,6 +1488,181 @@ pub fn summary(from_day: &str, to_day: &str, dim: SummaryDim) -> Result<Vec<Summ
     }
 
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// 分类维度聚合（趋势 / 分布 / 常按的键三张图的分类拼接数据源）
+// ---------------------------------------------------------------------------
+
+/// 一行聚合结果。label 随所在数组变化：days 里是 "YYYY-MM-DD"，
+/// hours 里是 "09" 这样的两位小时，keys 里是键名。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatRow {
+    pub label: String,
+    /// 分类 id；空串 = 未归类
+    pub cat: String,
+    pub n: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CategorySummary {
+    /// 天 × 分类。来自 daily_apps（本来就带 app 维度），任何范围都便宜。
+    pub days: Vec<CatRow>,
+    /// 小时 × 分类。需要扫 events 明细（月表有 ts 索引），范围 > 31 天时为空。
+    pub hours: Vec<CatRow>,
+    /// 键 × 分类。同上。
+    pub keys: Vec<CatRow>,
+}
+
+/// 按分类聚合。`cat_by_process`：进程名 → 分类 id（调用方从当前设置取），
+/// 历史数据统一按**现在的**归类口径着色。
+pub fn category_summary(
+    from_day: &str,
+    to_day: &str,
+    cat_by_process: &HashMap<String, String>,
+) -> Result<CategorySummary, String> {
+    let conn = open_meta_readonly()?;
+
+    // app_id → 分类 id
+    let mut cat_by_app: HashMap<i64, String> = HashMap::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT id, process FROM apps")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?;
+        for (id, process) in rows.flatten() {
+            if let Some(cat) = cat_by_process.get(&process) {
+                cat_by_app.insert(id, cat.clone());
+            }
+        }
+    }
+
+    // ---- 天 × 分类 ----
+    let mut days: Vec<CatRow> = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT day, app_id, SUM(n) FROM daily_apps \
+                 WHERE kind = 0 AND day >= ?1 AND day <= ?2 AND app_id IS NOT NULL \
+                 GROUP BY day, app_id",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![from_day, to_day], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut agg: HashMap<(String, String), i64> = HashMap::new();
+        for (day, app_id, n) in rows.flatten() {
+            let cat = cat_by_app.get(&app_id).cloned().unwrap_or_default();
+            *agg.entry((day, cat)).or_default() += n;
+        }
+        for ((day, cat), n) in agg {
+            days.push(CatRow { label: day, cat, n });
+        }
+        days.sort_by(|a, b| a.label.cmp(&b.label).then(a.cat.cmp(&b.cat)));
+    }
+
+    // ---- 小时 / 键 × 分类：扫 events 明细，范围 > 31 天直接放弃 ----
+    let (mut hours, mut keys) = (Vec::new(), Vec::new());
+    let span = match (
+        chrono::NaiveDate::parse_from_str(from_day, "%Y-%m-%d"),
+        chrono::NaiveDate::parse_from_str(to_day, "%Y-%m-%d"),
+    ) {
+        (Ok(f), Ok(t)) => (t - f).num_days(),
+        _ => -1,
+    };
+    if span >= 0 && span <= 31 {
+        let end_day = (chrono::NaiveDate::parse_from_str(to_day, "%Y-%m-%d")
+            .map_err(|_| "日期格式错误".to_string())?
+            + chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+        let start_ms = local_midnight_ms(from_day);
+        let end_ms = local_midnight_ms(&end_day);
+        let ev_path = events_db_path();
+        if ev_path.exists() {
+            let ev = Connection::open_with_flags(&ev_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+                .map_err(|e| format!("打开 events.db 失败: {e}"))?;
+            ev.busy_timeout(Duration::from_millis(2000))
+                .map_err(|e| e.to_string())?;
+            let mut hour_agg: HashMap<(i64, String), i64> = HashMap::new();
+            let mut key_agg: HashMap<(i32, String), i64> = HashMap::new();
+            let months = list_event_months(&ev)?;
+            for month in months {
+                // 只碰与范围重叠的月表（month 是 "YYYYMM"，取 from/to 的前 7 位去横杠比较）
+                if month < from_day[..7].replace('-', "")
+                    || month > to_day[..7].replace('-', "")
+                {
+                    continue;
+                }
+                let table = month_table_name(&month);
+                let sql = format!(
+                    "SELECT ts, code, app_id FROM {table} \
+                     WHERE kind = 0 AND ts >= ?1 AND ts < ?2"
+                );
+                let mut stmt = ev.prepare(&sql).map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(params![start_ms, end_ms], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, i32>(1)?,
+                            r.get::<_, Option<i64>>(2)?,
+                        ))
+                    })
+                    .map_err(|e| e.to_string())?;
+                for (ts, code, app_id) in rows.flatten() {
+                    let (day, hour) = day_hour_local(ts);
+                    if day.as_str() < from_day || day.as_str() > to_day {
+                        continue;
+                    }
+                    let cat = app_id
+                        .and_then(|id| cat_by_app.get(&id).cloned())
+                        .unwrap_or_default();
+                    *hour_agg.entry((hour as i64, cat.clone())).or_default() += 1;
+                    *key_agg.entry((code, cat)).or_default() += 1;
+                }
+            }
+            for ((hour, cat), n) in hour_agg {
+                hours.push(CatRow {
+                    label: format!("{hour:02}"),
+                    cat,
+                    n,
+                });
+            }
+            hours.sort_by(|a, b| a.label.cmp(&b.label).then(a.cat.cmp(&b.cat)));
+            for ((code, cat), n) in key_agg {
+                keys.push(CatRow {
+                    label: vk_label(code as i64),
+                    cat,
+                    n,
+                });
+            }
+            keys.sort_by(|a, b| b.n.cmp(&a.n).then(a.label.cmp(&b.label)));
+        }
+    }
+
+    Ok(CategorySummary { days, hours, keys })
+}
+
+/// 本地某天的 0 点对应的毫秒时间戳。
+fn local_midnight_ms(day: &str) -> i64 {
+    match chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d") {
+        Ok(d) => match Local.from_local_datetime(&d.and_hms_opt(0, 0, 0).unwrap()) {
+            chrono::LocalResult::Single(dt) => dt.timestamp_millis(),
+            chrono::LocalResult::Ambiguous(dt, _) => dt.timestamp_millis(),
+            chrono::LocalResult::None => 0,
+        },
+        Err(_) => 0,
+    }
 }
 
 // ---------------------------------------------------------------------------

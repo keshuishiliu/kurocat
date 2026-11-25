@@ -70,6 +70,56 @@ export function redrawAllCharts(): void {
 export interface Point {
   label: string;
   value: number;
+  /** 分类分段。有值时柱体按 segs 顺序拼接着色（v 之和应等于 value）。 */
+  segs?: Seg[];
+}
+
+/** 柱内一段：v 数值、c 颜色、name 分类名（悬浮提示用）。 */
+export interface Seg {
+  v: number;
+  c: string;
+  name: string;
+}
+
+// ---------------------------------------------------------------------------
+// 悬浮数值提示：一个全局浮层 + 渲染后给带 data-tip 的矩形绑事件。
+// 用 textContent 写入，内容里的换行靠 CSS white-space: pre-line 展示。
+// ---------------------------------------------------------------------------
+
+let tipEl: HTMLDivElement | null = null;
+
+function tip(): HTMLDivElement {
+  if (!tipEl) {
+    tipEl = document.createElement('div');
+    tipEl.className = 'chart-tip';
+    tipEl.style.opacity = '0';
+    document.body.appendChild(tipEl);
+  }
+  return tipEl;
+}
+
+function bindTips(host: HTMLElement): void {
+  const t = tip();
+  host.querySelectorAll<SVGRectElement>('[data-tip]').forEach((el) => {
+    el.addEventListener('mousemove', (ev) => {
+      t.textContent = el.dataset.tip ?? '';
+      t.style.opacity = '1';
+      const x = Math.min(ev.clientX + 14, window.innerWidth - t.offsetWidth - 8);
+      const y = Math.min(ev.clientY + 16, window.innerHeight - t.offsetHeight - 8);
+      t.style.left = `${x}px`;
+      t.style.top = `${y}px`;
+    });
+    el.addEventListener('mouseleave', () => {
+      t.style.opacity = '0';
+    });
+  });
+}
+
+/** 生成一行的悬浮文案：`标签 · 分类名：数值` 或 `标签：数值`。 */
+function tipText(label: string, seg: Seg | null, value: number): string {
+  return seg
+    ? `${label}\n${seg.name}：${fmtNum(seg.v)}\n合计 ${fmtNum(value)}`
+    : `${label}：${fmtNum(value)}`;
 }
 
 function esc(s: string): string {
@@ -163,15 +213,24 @@ export function renderBars(
     );
   }
 
-  // 柱
+  // 柱（有 segs 时按分类拼接着色，段从下往上叠）
   rows.forEach((d, i) => {
-    const h = max > 0 ? (d.value / max) * ih : 0;
     const x = padL + slot * i + (slot - barW) / 2;
-    const y = padT + ih - h;
-    if (h > 0.2) {
-      parts.push(
-        `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" rx="${Math.min(2, h / 2).toFixed(1)}" fill="${C.accentDim}"/>`,
-      );
+    // 每列先铺一块透明的「命中区」，悬停柱体上方的空白也能看到合计
+    parts.push(
+      `<rect x="${x.toFixed(1)}" y="${padT}" width="${barW.toFixed(1)}" height="${ih}" fill="transparent" data-tip="${esc(tipText(d.label, null, d.value))}"/>`,
+    );
+    const segs = d.segs?.length ? d.segs : [{ v: d.value, c: C.accentDim, name: '' }];
+    let yBase = padT + ih;
+    for (const seg of segs) {
+      if (seg.v <= 0) continue;
+      const h = (seg.v / max) * ih;
+      yBase -= h;
+      if (h > 0.2) {
+        parts.push(
+          `<rect x="${x.toFixed(1)}" y="${yBase.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" fill="${seg.c}" data-tip="${esc(tipText(d.label, seg, d.value))}"/>`,
+        );
+      }
     }
   });
 
@@ -189,6 +248,7 @@ export function renderBars(
 
   parts.push('</svg>');
   host.innerHTML = parts.join('');
+  bindTips(host);
 }
 
 /**
@@ -265,8 +325,17 @@ export function renderLine(
     );
   });
 
+  // 每个数据点一条透明命中带（画在最上层），悬停即显示该点数值
+  rows.forEach((d, i) => {
+    const x0 = padL + stepX * i - stepX / 2;
+    parts.push(
+      `<rect x="${x0.toFixed(1)}" y="${padT}" width="${Math.max(1, stepX).toFixed(1)}" height="${ih}" fill="transparent" data-tip="${esc(tipText(d.label, null, d.value))}"/>`,
+    );
+  });
+
   parts.push('</svg>');
   host.innerHTML = parts.join('');
+  bindTips(host);
 }
 
 /** 横向条。适合按程序 / 按键排行。`colors` 可按行着色（按分类统计时用分类色）。 */
@@ -311,7 +380,6 @@ export function renderHBars(
     const barY = y + (rowH - barH) / 2;
     const ty = barY + barH / 2 + 4;
     const w = Math.max(2, (d.value / max) * barMax);
-    const color = opts.colors?.[i] ?? (i === 0 ? C.accent : C.accentDim);
     const icon = opts.icons?.[i] ?? null;
     if (icon) {
       parts.push(
@@ -326,9 +394,19 @@ export function renderHBars(
     parts.push(
       `<rect x="${labelW}" y="${barY.toFixed(1)}" width="${barMax}" height="${barH}" rx="3" fill="${C.track}"/>`,
     );
-    parts.push(
-      `<rect x="${labelW}" y="${barY.toFixed(1)}" width="${w.toFixed(1)}" height="${barH}" rx="3" fill="${color}"/>`,
-    );
+    // 有 segs 时条内按分类横向拼接；无 segs 用行色（首行亮、其余淡）
+    const segs = d.segs?.length
+      ? d.segs
+      : [{ v: d.value, c: opts.colors?.[i] ?? (i === 0 ? C.accent : C.accentDim), name: '' }];
+    let xSeg = labelW;
+    for (const seg of segs) {
+      if (seg.v <= 0) continue;
+      const wSeg = Math.max(1.5, (seg.v / Math.max(1, d.value)) * w);
+      parts.push(
+        `<rect x="${xSeg.toFixed(1)}" y="${barY.toFixed(1)}" width="${wSeg.toFixed(1)}" height="${barH}" rx="3" fill="${seg.c}" data-tip="${esc(tipText(d.label, seg.name ? seg : null, d.value))}"/>`,
+      );
+      xSeg += wSeg;
+    }
     parts.push(
       `<text x="${W}" y="${ty.toFixed(1)}" fill="${C.label}" font-size="${FONT}" text-anchor="end">${esc(fmtNum(d.value))}</text>`,
     );
@@ -336,6 +414,7 @@ export function renderHBars(
 
   parts.push('</svg>');
   host.innerHTML = parts.join('');
+  bindTips(host);
 }
 
 function clip(s: string, max: number): string {

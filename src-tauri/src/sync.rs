@@ -70,7 +70,12 @@ use tauri::{AppHandle, Emitter};
 /// WebDAV 上的根目录名。所有机器共用，子目录按 machine_id 隔离。
 const DAV_ROOT: &str = "KuroCatSync";
 /// 合并包格式版本。结构不兼容时递增，旧包导入时按 format 拒绝。
-const PACK_FORMAT: u32 = 1;
+/// 合并包格式版本。
+///
+/// v1 → v2（v4.15.3）：v1 的汇总表导出**没有剔除导入贡献**（回声 bug），
+/// 甲导入乙的数据后导出时会连乙的一起发回去，乙再导入就翻倍滚雪球。
+/// v2 导出时按 merge_state.applied 剔除；导入侧拒收 v1 包并直接登记跳过。
+const PACK_FORMAT: u32 = 2;
 /// 单包事件明细上限。超出部分留给下一个包（水位线按实际导出的最大 ts 推进）。
 const PACK_MAX_EVENTS: usize = 200_000;
 /// 单包轨迹采样点上限。
@@ -218,10 +223,15 @@ impl MergePack {
     }
 }
 
-/// 合并包文件名：`<导出时刻13位>_<序号6位>_<machine_id>.json`。
-/// 前缀时间戳让「清理超期旧包」不用下载内容就能判断。
+/// 合并包文件名：`<导出时刻13位>_<序号6位>_<machine_id>_f<格式>.json`。
+/// 前缀时间戳让「清理超期旧包」不用下载内容就能判断；尾部格式后缀让
+/// 清理时能识别并删除**旧格式的遗留包**（v1 包带回声，必须清除，
+/// 见 [`PACK_FORMAT`] 的版本说明）。
 fn pack_name(exported_at: i64, seq: i64, machine_id: &str) -> String {
-    format!("{:013}_{:06}_{}.json", exported_at, seq, machine_id)
+    format!(
+        "{:013}_{:06}_{}_f{}.json",
+        exported_at, seq, machine_id, PACK_FORMAT
+    )
 }
 
 /// 合并结果，给前端 toast 用。
@@ -323,7 +333,36 @@ fn open_meta() -> Result<Connection, String> {
     // 建齐所有表（含 sync 三张表）。记录功能从没开过也能用同步。
     conn.execute_batch(recorder::META_SCHEMA)
         .map_err(|e| format!("建表失败: {e}"))?;
+    migrate_merge_state_applied(&conn)?;
     Ok(conn)
+}
+
+/// merge_state 老库迁移：补 applied 列，并把存量行的 applied 初始化为 last_n。
+///
+/// 初始化依据：导入是单调差值累加（首次导入 applied 整包值，此后只加增量），
+/// 只要来源值不回落，Σ 增量 = last_n。值回落时会低估一点贡献，残留少量
+/// 回声，但回落只在来源清库时发生，量级可忽略。用 sync_state 一次性标记
+/// 防止重复执行（新写入的行 applied 与 last_n 是独立演化的）。
+fn migrate_merge_state_applied(conn: &Connection) -> Result<(), String> {
+    let has: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('merge_state') WHERE name = 'applied'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if has == 0 {
+        conn.execute_batch(
+            "ALTER TABLE merge_state ADD COLUMN applied INTEGER NOT NULL DEFAULT 0;",
+        )
+        .map_err(|e| format!("merge_state 加 applied 列失败: {e}"))?;
+    }
+    if get_state(conn, "ms_applied_migrated").is_none() {
+        conn.execute("UPDATE merge_state SET applied = last_n", [])
+            .map_err(|e| e.to_string())?;
+        let _ = set_state(conn, "ms_applied_migrated", "1");
+    }
+    Ok(())
 }
 
 /// 只读打开 meta.db（不存在不创建）。状态查询用。
@@ -864,6 +903,10 @@ fn build_pack(
         pack.focus = rows.flatten().collect();
     }
 
+    // ---- 防回声：汇总值里的导入贡献不能带出去（v1 的致命缺陷） ----
+    // 事件/轨迹靠 src 列过滤，汇总表没有来源列，用 merge_state.applied 反推。
+    strip_imported_contrib(meta, &mut pack);
+
     Ok(pack)
 }
 
@@ -885,13 +928,75 @@ fn merge_state_get(conn: &Connection, src: &str, gkey: &str) -> i64 {
     .unwrap_or(0)
 }
 
-fn merge_state_set(conn: &Connection, src: &str, gkey: &str, value: i64) -> rusqlite::Result<()> {
+/// 更新 last_n 并**累加**本次实际入账的增量到 applied。
+/// applied 是「从该来源累计已写进本机汇总表的量」，导出侧靠它剔除回声。
+fn merge_state_apply(
+    conn: &Connection,
+    src: &str,
+    gkey: &str,
+    value: i64,
+    applied_delta: i64,
+) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO merge_state(source_id, gkey, last_n) VALUES(?1, ?2, ?3) \
-         ON CONFLICT(source_id, gkey) DO UPDATE SET last_n = excluded.last_n",
-        params![src, gkey, value],
+        "INSERT INTO merge_state(source_id, gkey, last_n, applied) VALUES(?1, ?2, ?3, ?4) \
+         ON CONFLICT(source_id, gkey) DO UPDATE SET \
+         last_n = excluded.last_n, applied = applied + excluded.applied",
+        params![src, gkey, value, applied_delta.max(0)],
     )?;
     Ok(())
+}
+
+/// 某个统计键上，所有来源**累计已导入进本机**的量。
+/// 导出时「表值 − 该值」= 纯本机贡献，是防回声的核心。
+fn imported_contrib(conn: &Connection, gkey: &str) -> i64 {
+    conn.query_row(
+        "SELECT COALESCE(SUM(applied), 0) FROM merge_state WHERE gkey = ?1",
+        params![gkey],
+        |r| r.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
+}
+
+/// 从打包完成的汇总行里剔除导入贡献（防回声）。
+///
+/// 表里的汇总值 = 本机自记 + 从各来源导入的累计；导出只能带前者。
+/// 单独抽成函数：build_pack 末尾调用，测试也直接用它（不碰真实 events 库）。
+/// 剔除后 ≤ 0 的行直接丢弃——本机贡献为零的键没有发送的意义，
+/// 且丢弃后对端的 last_n 停在旧值，将来本机贡献恢复增长时差值照样正确。
+fn strip_imported_contrib(meta: &Connection, pack: &mut MergePack) {
+    pack.stats.retain_mut(|r| {
+        let gkey = format!("ds|{}|{}|{}", r.day, r.kind, r.code);
+        r.n -= imported_contrib(meta, &gkey);
+        r.n > 0
+    });
+    pack.hours.retain_mut(|r| {
+        let mut keep = false;
+        for (tag, val) in [("kd", &mut r.kd), ("md", &mut r.md)] {
+            let gkey = format!("dh|{}|{}|{}", r.day, r.hour, tag);
+            *val -= imported_contrib(meta, &gkey);
+            keep |= *val > 0;
+        }
+        keep
+    });
+    pack.app_days.retain_mut(|r| {
+        let mut keep = false;
+        for (tag, val) in [("n", &mut r.n), ("as", &mut r.secs)] {
+            let gkey = format!("da|{}|{}|{}|{}", r.day, r.process, r.kind, tag);
+            *val -= imported_contrib(meta, &gkey);
+            keep |= *val > 0;
+        }
+        keep
+    });
+    pack.app_keys.retain_mut(|r| {
+        let gkey = format!("mk|{}|{}|{}", r.month, r.process, r.code);
+        r.n -= imported_contrib(meta, &gkey);
+        r.n > 0
+    });
+    pack.focus.retain_mut(|r| {
+        let gkey = format!("df|{}|{}|{}", r.day, r.hour, r.process);
+        r.secs -= imported_contrib(meta, &gkey);
+        r.secs > 0
+    });
 }
 
 fn local_app_id(conn: &Connection, process: &str) -> Option<i64> {
@@ -1094,7 +1199,7 @@ fn import_pack(
                 )
                 .map_err(|e| e.to_string())?;
             }
-            merge_state_set(&tx, src, &gkey, r.n).map_err(|e| e.to_string())?;
+            merge_state_apply(&tx, src, &gkey, r.n, delta).map_err(|e| e.to_string())?;
         }
         for r in &pack.hours {
             for (tag, val, col) in [("kd", r.kd, "keydown"), ("md", r.md, "mousedown")] {
@@ -1111,7 +1216,7 @@ fn import_pack(
                     )
                     .map_err(|e| e.to_string())?;
                 }
-                merge_state_set(&tx, src, &gkey, val).map_err(|e| e.to_string())?;
+                merge_state_apply(&tx, src, &gkey, val, delta).map_err(|e| e.to_string())?;
             }
         }
         for r in &pack.app_days {
@@ -1144,7 +1249,7 @@ fn import_pack(
                 }
                 // 即使本机暂时没有这个进程（映射不上），差值进度也要推进，
                 // 否则每次包都带着同一笔积压增量，将来一映射就重复入账。
-                merge_state_set(&tx, src, &gkey, val).map_err(|e| e.to_string())?;
+                merge_state_apply(&tx, src, &gkey, val, delta).map_err(|e| e.to_string())?;
             }
         }
         for r in &pack.app_keys {
@@ -1162,7 +1267,7 @@ fn import_pack(
                     .map_err(|e| e.to_string())?;
                 }
             }
-            merge_state_set(&tx, src, &gkey, r.n).map_err(|e| e.to_string())?;
+            merge_state_apply(&tx, src, &gkey, r.n, delta).map_err(|e| e.to_string())?;
         }
         for r in &pack.focus {
             let gkey = format!("df|{}|{}|{}", r.day, r.hour, r.process);
@@ -1180,7 +1285,7 @@ fn import_pack(
                     .map_err(|e| e.to_string())?;
                 }
             }
-            merge_state_set(&tx, src, &gkey, r.secs).map_err(|e| e.to_string())?;
+            merge_state_apply(&tx, src, &gkey, r.secs, delta).map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())?;
     }
@@ -1388,8 +1493,10 @@ fn export_once(
     set_state(meta, "export_day", &today)?;
     set_state(meta, "export_month", &month)?;
 
-    // 清理自己名下超期的旧包（只删自己的；保留天数在设置里配，默认 15 天。
-    // 注意别设太小：对端没来得及导入的包删掉就真没了）
+    // 清理自己名下的旧包（只删自己的；保留天数在设置里配，默认 15 天。
+    // 注意别设太小：对端没来得及导入的包删掉就真没了）。
+    // 另外无条件删除**非当前格式**的遗留包：v1 包带回声（见 PACK_FORMAT），
+    // 对端升级后误导入会翻倍，宁可重传也不能让它留在云端。
     if let Ok(entries) = dav.list(&own) {
         let retain = settings
             .lock()
@@ -1397,14 +1504,22 @@ fn export_once(
             .sync
             .retain_days as i64;
         let cutoff = now_ms() - retain.max(1) * 86_400_000;
+        let cur_suffix = format!("_f{PACK_FORMAT}.json");
         for e in entries {
             if e.is_dir || !e.name.ends_with(".json") {
                 continue;
             }
-            if let Ok(ts) = e.name[..13].parse::<i64>() {
-                if ts < cutoff {
-                    let _ = dav.delete(&format!("{own}/{}", e.name));
-                }
+            let legacy = !e.name.ends_with(&cur_suffix);
+            let expired = e
+                .name
+                .chars()
+                .take(13)
+                .all(|c| c.is_ascii_digit())
+                .then(|| e.name[..13].parse::<i64>().ok())
+                .flatten()
+                .is_some_and(|ts| ts < cutoff);
+            if legacy || expired {
+                let _ = dav.delete(&format!("{own}/{}", e.name));
             }
         }
     }
@@ -1897,9 +2012,78 @@ mod tests {
     #[test]
     fn pack_name_is_sortable_and_parseable() {
         let name = pack_name(1_700_000_000_000, 42, "abcd1234abcd1234");
-        assert_eq!(name, "1700000000000_000042_abcd1234abcd1234.json");
+        assert_eq!(name, "1700000000000_000042_abcd1234abcd1234_f2.json");
         let ts: i64 = name[..13].parse().unwrap();
         assert_eq!(ts, 1_700_000_000_000);
+    }
+
+    /// 防回声核心：导出前剔除汇总值里已导入的贡献。
+    #[test]
+    fn export_strips_imported_contrib() {
+        let meta = mem_meta();
+        let events = Connection::open_in_memory().unwrap();
+        let pack_in = sample_pack("src1");
+        // 模拟 v4.15.2 时代的导入：对方的 stats=100、focus=97 进入本机表
+        let mut pack_in = pack_in;
+        pack_in.focus = vec![PackRowFocus {
+            day: "2026-11-25".into(),
+            hour: 9,
+            process: "game.exe".into(),
+            secs: 97,
+        }];
+        import_pack(
+            &pack_in,
+            "src1",
+            "p1.json",
+            &meta,
+            Some(&events),
+            None,
+            &Arc::new(Mutex::new(AppSettings::default())),
+        )
+        .unwrap();
+
+        // 本机又自己记了 50：表值 = 150（100 导入 + 50 自记）
+        meta.execute(
+            "UPDATE daily_stats SET n = n + 50", [],
+        ).unwrap();
+
+        let mut out = sample_pack("self");
+        out.stats = vec![PackRowStats {
+            day: "2026-11-25".into(),
+            kind: recorder::KIND_KEY_DOWN,
+            code: 65,
+            n: 150, // 表值
+        }];
+        out.focus = vec![PackRowFocus {
+            day: "2026-11-25".into(),
+            hour: 9,
+            process: "game.exe".into(),
+            secs: 97, // 全是导入的
+        }];
+        strip_imported_contrib(&meta, &mut out);
+
+        assert_eq!(out.stats.len(), 1);
+        assert_eq!(out.stats[0].n, 50, "导出值必须剔除导入贡献 100");
+        assert!(out.focus.is_empty(), "纯导入的行应整行丢弃");
+    }
+
+    /// 导入侧推进 applied：同一来源值增长时 applied 只加增量，
+    /// 且 drop 后（值回落）applied 不减。
+    #[test]
+    fn merge_state_applied_accumulates_deltas() {
+        let meta = mem_meta();
+        merge_state_apply(&meta, "src1", "ds|d|0|65", 100, 100).unwrap();
+        merge_state_apply(&meta, "src1", "ds|d|0|65", 150, 50).unwrap();
+        merge_state_apply(&meta, "src1", "ds|d|0|65", 120, 0).unwrap(); // 回落
+        let (last, applied): (i64, i64) = meta
+            .query_row(
+                "SELECT last_n, applied FROM merge_state WHERE source_id='src1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(last, 120);
+        assert_eq!(applied, 150, "applied = 累计实际入账量");
     }
 
     #[test]
