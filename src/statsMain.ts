@@ -205,7 +205,7 @@ const DEMO_APP_META: Record<string, { name: string; version: string; path: strin
   },
   'kurocat.exe': {
     name: 'Kuro 猫猫宠',
-    version: '4.15.1',
+    version: '4.15.2',
     path: 'D:\\Programs\\kurocat\\KuroCat.exe',
   },
   'windowsterminal.exe': {

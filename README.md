@@ -5,9 +5,9 @@
 
 # 🐈‍⬛ KuroCat（衍生修改版）
 
-**当前版本 `v4.15.1`**（= 上游 v4.9.1 + 本仓库改动）。App 内「检查更新」与更新包地址校验已改为锚定本仓库 [keshuishiliu/kurocat](https://github.com/keshuishiliu/kurocat) Releases，不再跟随上游发布通道。
+**当前版本 `v4.15.2`**（= 上游 v4.9.1 + 本仓库改动）。App 内「检查更新」与更新包地址校验已改为锚定本仓库 [keshuishiliu/kurocat](https://github.com/keshuishiliu/kurocat) Releases，不再跟随上游发布通道。
 
-**下载**：[Releases · v4.15.1](https://github.com/keshuishiliu/kurocat/releases/latest) —— Windows 安装包 / **Windows 免安装版（exe 与 zip）** / macOS Universal `dmg` / Linux `deb` + `AppImage`，由 GitHub Actions 三平台构建，安装包未签名。
+**下载**：[Releases · v4.15.2](https://github.com/keshuishiliu/kurocat/releases/latest) —— Windows 安装包 / **Windows 免安装版（exe 与 zip）** / macOS Universal `dmg` / Linux `deb` + `AppImage`，由 GitHub Actions 三平台构建，安装包未签名。
 
 ## 目录
 
@@ -261,8 +261,10 @@ cd src-tauri && cargo build
 
 ---
 
-## 八、协议
+## 八、协议与致谢
 
 本项目以 [MIT License](LICENSE) 发布，许可证全文与版权声明见仓库根目录的 [`LICENSE`](LICENSE)。
+
+**致谢**：本仓库是 [qianyiai/kurocat](https://github.com/qianyiai/kurocat) 的衍生分支（起点 v4.9.1）。桌宠本体——猫咪绘制、皮肤系统、MCP 服务、OBS 透明直播源、自动更新——均为上游原作者 qianyiai 的作品，感谢其以 MIT 协议开源。本项目仅在安全加固、绿色免安装版与输入统计等功能上做了增量改动。
 
 内置皮肤 **🐳 大肥鱼（鲸鱼娘）** 运行时素材基于 MIT 开源项目 [PC2005-cloud/dsh-pet](https://github.com/PC2005-cloud/dsh-pet)（参考衍生 [QCYTSN/dsh-dafeiyu](https://github.com/QCYTSN/dsh-dafeiyu)）制作，完整许可声明见 `src/assets/dafeiyu/LICENSE-MIT.txt`。
