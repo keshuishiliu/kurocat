@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter};
 
+const REPO_WEB_BASE: &str = "https://github.com/keshuishiliu/kurocat";
 const REPO_API_LATEST: &str = "https://api.github.com/repos/keshuishiliu/kurocat/releases/latest";
 const REPO_RELEASES_PAGE: &str = "https://github.com/keshuishiliu/kurocat/releases/latest";
 
@@ -52,7 +53,10 @@ impl PendingPortableUpdate {
     }
 }
 
-#[derive(Debug, Deserialize)]
+/// 与 GitHub API 的原生 snake_case 字段（tag_name / browser_download_url…）对齐。
+/// 不能用 camelCase：API 返回的是 snake_case，声明 camelCase 会永远解析失败。
+/// web 兜底合成的 JSON 与本结构互为镜像，同样用 snake_case。
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct GhRelease {
     tag_name: String,
     html_url: Option<String>,
@@ -61,7 +65,7 @@ struct GhRelease {
     assets: Vec<GhAsset>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct GhAsset {
     name: String,
     browser_download_url: String,
@@ -400,10 +404,57 @@ mod winhttp_client {
         WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest,
         WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse,
         WinHttpSendRequest, WinHttpSetOption, WinHttpSetTimeouts,
-        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_SECURE,
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_DISABLE_REDIRECTS, WINHTTP_FLAG_SECURE,
         WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2, WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3,
-        WINHTTP_OPTION_SECURE_PROTOCOLS, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
+        WINHTTP_OPTION_DISABLE_FEATURE, WINHTTP_OPTION_SECURE_PROTOCOLS,
+        WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_LOCATION, WINHTTP_QUERY_STATUS_CODE,
     };
+
+    /// GET 请求的附加选项。字段尽量少：目前只有「检查更新」需要非默认行为。
+    pub struct StreamOptions<'a> {
+        pub extra_headers: Option<&'a str>,
+        pub receive_timeout_ms: i32,
+        /// true = 不跟随 3xx 重定向，把 Location 头原样带回来（探测最新 tag 用）。
+        pub no_follow_redirects: bool,
+    }
+
+    /// 一次 GET 的结果摘要。`location` 只在不跟随重定向且返回 3xx 时有值。
+    pub struct StreamOutcome {
+        pub status: u32,
+        pub location: Option<String>,
+    }
+
+    /// 兼容旧调用方：跟随重定向、只关心 2xx 响应体。
+    pub fn get_stream(
+        url: &str,
+        user_agent: &str,
+        extra_headers: Option<&str>,
+        receive_timeout_ms: i32,
+        on_chunk: impl FnMut(&[u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        get_stream_opts(
+            url,
+            user_agent,
+            StreamOptions {
+                extra_headers,
+                receive_timeout_ms,
+                no_follow_redirects: false,
+            },
+            on_chunk,
+        )
+        .map(|_| ())
+    }
+
+    /// Performs a native WinHTTP GET request (no PowerShell / curl child process),
+    /// streaming response chunks into `on_chunk`. Supports Win7 SP1 through Win11
+    /// and honors system / PAC proxies automatically.
+    pub fn get_stream_opts(
+        url: &str,
+        user_agent: &str,
+        opts: StreamOptions<'_>,
+        mut on_chunk: impl FnMut(&[u8]) -> Result<(), String>,
+    ) -> Result<StreamOutcome, String> {
 
     struct Handle(*mut c_void);
 
@@ -421,16 +472,6 @@ mod winhttp_client {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    /// Performs a native WinHTTP GET request (no PowerShell / curl child process),
-    /// streaming response chunks into `on_chunk`. Supports Win7 SP1 through Win11
-    /// and honors system / PAC proxies automatically.
-    pub fn get_stream(
-        url: &str,
-        user_agent: &str,
-        extra_headers: Option<&str>,
-        receive_timeout_ms: i32,
-        mut on_chunk: impl FnMut(&[u8]) -> Result<(), String>,
-    ) -> Result<(), String> {
         let (is_https, host, port, path) = parse_http_url(url)?;
         let ua_w = to_wide(user_agent);
 
@@ -463,7 +504,7 @@ mod winhttp_client {
         let session = Handle(session_raw);
 
         unsafe {
-            let _ = WinHttpSetTimeouts(session.0, 15_000, 15_000, 30_000, receive_timeout_ms);
+            let _ = WinHttpSetTimeouts(session.0, 15_000, 15_000, 30_000, opts.receive_timeout_ms);
             let mut protocols =
                 WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
             if WinHttpSetOption(
@@ -511,7 +552,24 @@ mod winhttp_client {
         }
         let request = Handle(req_raw);
 
-        let headers_w = extra_headers.map(to_wide);
+        // 探测最新 tag 时不需要落地重定向后的整页 HTML，直接拿 Location 头就够。
+        if opts.no_follow_redirects {
+            let disabled = WINHTTP_DISABLE_REDIRECTS;
+            if unsafe {
+                WinHttpSetOption(
+                    request.0,
+                    WINHTTP_OPTION_DISABLE_FEATURE,
+                    &disabled as *const u32 as *const c_void,
+                    std::mem::size_of::<u32>() as u32,
+                )
+            } == 0
+            {
+                let err = unsafe { GetLastError() };
+                return Err(format!("禁用 HTTP 重定向失败 (错误码 {})", err));
+            }
+        }
+
+        let headers_w = opts.extra_headers.map(to_wide);
         let (hdr_ptr, hdr_len) = match &headers_w {
             Some(buf) => (buf.as_ptr(), (buf.len().saturating_sub(1)) as u32),
             None => (null(), 0),
@@ -547,6 +605,47 @@ mod winhttp_client {
             let err = unsafe { GetLastError() };
             return Err(format!("读取 HTTP 状态码失败 (错误码 {})", err));
         }
+
+        // 不跟随重定向模式：3xx 把 Location 带回去交给调用方，只有非 2xx/3xx 才算失败。
+        let mut location: Option<String> = None;
+        if opts.no_follow_redirects && (300..400).contains(&status_code) {
+            // 标准两段式取头：第一次传空缓冲拿所需字节数（这一步按设计
+            // 会以 ERROR_INSUFFICIENT_BUFFER 失败返回，len 被写上真实值）。
+            let mut len: u32 = 0;
+            unsafe {
+                WinHttpQueryHeaders(
+                    request.0,
+                    WINHTTP_QUERY_LOCATION,
+                    null(),
+                    null_mut(),
+                    &mut len,
+                    null_mut(),
+                )
+            };
+            if len > 0 {
+                let mut wbuf = vec![0u16; (len as usize).max(2)];
+                let mut len2 = len;
+                if unsafe {
+                    WinHttpQueryHeaders(
+                        request.0,
+                        WINHTTP_QUERY_LOCATION,
+                        null(),
+                        wbuf.as_mut_ptr() as *mut c_void,
+                        &mut len2,
+                        null_mut(),
+                    )
+                } != 0
+                {
+                    location =
+                        Some(String::from_utf16_lossy(&wbuf[..(len2 as usize / 2).min(wbuf.len())]));
+                }
+            }
+            if location.is_none() {
+                return Err(format!("服务器返回 HTTP {} 但未携带 Location 头", status_code));
+            }
+            return Ok(StreamOutcome { status: status_code, location });
+        }
+
         if !(200..=299).contains(&status_code) {
             return Err(format!("服务器返回 HTTP {}", status_code));
         }
@@ -585,17 +684,31 @@ mod winhttp_client {
             }
         }
 
-        Ok(())
+        Ok(StreamOutcome { status: status_code, location })
     }
 }
 
 #[cfg(windows)]
 fn fetch_latest_release_json() -> Result<String, String> {
     let ua = format!("KuroCat/{}", CURRENT_VERSION);
+    // 主通道走 api.github.com（信息全：资产、sha256、说明）；匿名请求每 IP 每小时
+    // 只有 60 次配额，共享代理出口 IP 很容易耗尽而返回 403，所以失败时退到
+    // github.com 网页端（/releases/latest 302 + expanded_assets），网页端没有这种配额。
+    match fetch_api_json_windows(&ua) {
+        Ok(text) => Ok(text),
+        Err(api_err) => match fetch_release_json_via_web_windows(&ua) {
+            Ok(text) => Ok(text),
+            Err(web_err) => Err(format!("{api_err}；网页端兜底也失败：{web_err}")),
+        },
+    }
+}
+
+#[cfg(windows)]
+fn fetch_api_json_windows(ua: &str) -> Result<String, String> {
     let mut body = Vec::with_capacity(8192);
     winhttp_client::get_stream(
         REPO_API_LATEST,
-        &ua,
+        ua,
         Some("Accept: application/vnd.github+json\r\n"),
         20_000,
         |chunk| {
@@ -614,8 +727,119 @@ fn fetch_latest_release_json() -> Result<String, String> {
     Ok(text)
 }
 
+/// web 兜底：不碰 api.github.com。
+///
+/// `/releases/latest` 302 到 `/releases/tag/vX.Y.Z`，Location 里就有最新 tag；
+/// 再拉 `expanded_assets/<tag>`（发布页的资产子页面）拿资产文件名，下载地址可以
+/// 直接拼出来。代价：拿不到 sha256（`digest` 只有 API 提供）与更新说明，兜底
+/// 路径下载时会跳过摘要校验。
+#[cfg(windows)]
+fn fetch_release_json_via_web_windows(ua: &str) -> Result<String, String> {
+    let outcome = winhttp_client::get_stream_opts(
+        REPO_RELEASES_PAGE,
+        ua,
+        winhttp_client::StreamOptions {
+            extra_headers: None,
+            receive_timeout_ms: 20_000,
+            no_follow_redirects: true,
+        },
+        |_| Ok(()),
+    )?;
+    let location = outcome
+        .location
+        .ok_or_else(|| format!("预期 302 重定向，实际 HTTP {}", outcome.status))?;
+    let tag = parse_latest_tag_from_location(&location)
+        .ok_or_else(|| format!("无法从重定向地址解析版本号: {location}"))?;
+
+    let mut body = Vec::with_capacity(8192);
+    winhttp_client::get_stream(&expanded_assets_url(&tag), ua, None, 20_000, |chunk| {
+        if body.len() + chunk.len() > 2 * 1024 * 1024 {
+            return Err("发布页资产列表响应过大".to_string());
+        }
+        body.extend_from_slice(chunk);
+        Ok(())
+    })?;
+    let names = parse_web_asset_names(&String::from_utf8_lossy(&body), &tag);
+    build_web_release_json(&tag, names)
+}
+
+/// `/releases/latest` 的 302 地址 → 最新 tag（形如 `v4.15.0`）。绝对/相对地址都认。
+fn parse_latest_tag_from_location(location: &str) -> Option<String> {
+    let marker = "/releases/tag/";
+    let idx = location.find(marker)?;
+    let rest = &location[idx + marker.len()..];
+    let seg = rest.split(['?', '#']).next().unwrap_or(rest);
+    let seg = seg.trim_end_matches('/');
+    if seg.is_empty() {
+        None
+    } else {
+        Some(seg.to_string())
+    }
+}
+
+fn expanded_assets_url(tag: &str) -> String {
+    format!("{REPO_WEB_BASE}/releases/expanded_assets/{tag}")
+}
+
+/// 从 expanded_assets 页面 HTML 里抠出资产文件名（按 tag 段切分，天然去重）。
+fn parse_web_asset_names(html: &str, tag: &str) -> Vec<String> {
+    let needle = "/releases/download/";
+    let mut out: Vec<String> = Vec::new();
+    for frag in html.split('"') {
+        let Some(pos) = frag.find(needle) else {
+            continue;
+        };
+        let path = &frag[pos + needle.len()..];
+        let Some((_, rest)) = path.split_once(&format!("{tag}/")) else {
+            continue;
+        };
+        let name = rest.split(['?', '#']).next().unwrap_or(rest);
+        let name = name.trim_end_matches('/');
+        if name.is_empty() || out.iter().any(|n| n == name) {
+            continue;
+        }
+        out.push(name.to_string());
+    }
+    out
+}
+
+/// 用 tag + 资产名合成与 API JSON 同形的 release 描述，后续解析逻辑完全复用。
+fn build_web_release_json(tag: &str, names: Vec<String>) -> Result<String, String> {
+    if names.is_empty() {
+        return Err("发布页资产列表为空".to_string());
+    }
+    let rel = GhRelease {
+        tag_name: tag.to_string(),
+        html_url: Some(format!("{REPO_WEB_BASE}/releases/tag/{tag}")),
+        // 更新说明只有 API 给；兜底路径拿不到就不展示，不影响升级流程。
+        body: None,
+        assets: names
+            .into_iter()
+            .map(|name| GhAsset {
+                browser_download_url: format!("{REPO_WEB_BASE}/releases/download/{tag}/{name}"),
+                name,
+                size: None,
+                digest: None,
+            })
+            .collect(),
+    };
+    serde_json::to_string(&rel).map_err(|e| format!("序列化 web 版本信息失败: {e}"))
+}
+
 #[cfg(not(windows))]
 fn fetch_latest_release_json() -> Result<String, String> {
+    // 与 Windows 侧同策略：API 优先（信息全），403/限流等失败退 github.com 网页端。
+    match fetch_api_json_curl() {
+        Ok(text) => Ok(text),
+        Err(api_err) => match fetch_release_json_via_web_curl() {
+            Ok(text) => Ok(text),
+            Err(web_err) => Err(format!("{api_err}；网页端兜底也失败：{web_err}")),
+        },
+    }
+}
+
+#[cfg(not(windows))]
+fn fetch_api_json_curl() -> Result<String, String> {
     use std::process::Command;
 
     let curl_bin = if cfg!(target_os = "macos") {
@@ -653,6 +877,49 @@ fn fetch_latest_release_json() -> Result<String, String> {
         return Err("GitHub 返回空响应".to_string());
     }
     Ok(text)
+}
+
+#[cfg(not(windows))]
+fn fetch_release_json_via_web_curl() -> Result<String, String> {
+    use std::process::Command;
+
+    let ua = format!("KuroCat/{}", CURRENT_VERSION);
+    let redirect = Command::new("curl")
+        .args([
+            "-sS",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{redirect_url}",
+            "--max-time",
+            "20",
+            REPO_RELEASES_PAGE,
+        ])
+        .output()
+        .map_err(|e| format!("无法调用 curl 探测发布页重定向: {e}"))?;
+    if !redirect.status.success() {
+        return Err("连接 github.com 发布页失败，请检查网络或代理".to_string());
+    }
+    let location = String::from_utf8_lossy(&redirect.stdout).trim().to_string();
+    let tag = parse_latest_tag_from_location(&location)
+        .ok_or_else(|| format!("无法从重定向地址解析版本号: {location}"))?;
+
+    let assets = Command::new("curl")
+        .args([
+            "-fsSL",
+            "--max-time",
+            "20",
+            "-H",
+            &format!("User-Agent: {ua}"),
+            &expanded_assets_url(&tag),
+        ])
+        .output()
+        .map_err(|e| format!("无法调用 curl 读取发布页资产列表: {e}"))?;
+    if !assets.status.success() {
+        return Err("读取发布页资产列表失败".to_string());
+    }
+    let names = parse_web_asset_names(&String::from_utf8_lossy(&assets.stdout), &tag);
+    build_web_release_json(&tag, names)
 }
 
 pub fn check_latest_update() -> Result<UpdateInfo, String> {
@@ -1389,6 +1656,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn latest_tag_parsed_from_redirect_location() {
+        // GitHub 实际返回的是绝对地址，但也兜住相对地址 / 带参数的形态
+        assert_eq!(
+            parse_latest_tag_from_location("https://github.com/keshuishiliu/kurocat/releases/tag/v4.15.0").as_deref(),
+            Some("v4.15.0")
+        );
+        assert_eq!(
+            parse_latest_tag_from_location("/keshuishiliu/kurocat/releases/tag/v4.16.0-beta.1").as_deref(),
+            Some("v4.16.0-beta.1")
+        );
+        assert_eq!(
+            parse_latest_tag_from_location("https://github.com/keshuishiliu/kurocat/releases/tag/v4.15.0?foo=bar").as_deref(),
+            Some("v4.15.0")
+        );
+        assert_eq!(parse_latest_tag_from_location("https://github.com/keshuishiliu/kurocat/releases/latest"), None);
+        assert_eq!(parse_latest_tag_from_location("/keshuishiliu/kurocat/releases/tag/"), None);
+    }
+
+    #[test]
+    fn web_asset_names_parsed_from_expanded_assets_html() {
+        let html = r#"<div id="released-assets">
+            <a href="/keshuishiliu/kurocat/releases/download/v4.15.0/KuroCat-4.15.0-windows-x64.exe">exe</a>
+            <a href="/keshuishiliu/kurocat/releases/download/v4.15.0/KuroCat-4.15.0-x64-setup.exe">setup</a>
+            <a href="/keshuishiliu/kurocat/releases/download/v4.15.0/KuroCat-4.15.0-windows-x64.exe">dup</a>
+            <a href="/keshuishiliu/kurocat/releases/download/v4.14.0/old.exe">别的 tag，不算</a>
+            <a href="/keshuishiliu/kurocat/issues">无关链接</a>
+        </div>"#;
+        let names = parse_web_asset_names(html, "v4.15.0");
+        assert_eq!(
+            names,
+            vec![
+                "KuroCat-4.15.0-windows-x64.exe".to_string(),
+                "KuroCat-4.15.0-x64-setup.exe".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn web_release_json_round_trips_like_api_shape() {
+        let json = build_web_release_json(
+            "v4.15.0",
+            vec!["KuroCat-4.15.0-windows-x64.exe".to_string()],
+        )
+        .unwrap();
+        let rel: GhRelease = serde_json::from_str(&json).unwrap();
+        assert_eq!(rel.tag_name, "v4.15.0");
+        assert_eq!(rel.assets.len(), 1);
+        assert_eq!(
+            rel.assets[0].browser_download_url,
+            "https://github.com/keshuishiliu/kurocat/releases/download/v4.15.0/KuroCat-4.15.0-windows-x64.exe"
+        );
+        assert!(rel.assets[0].digest.is_none());
+        assert!(rel.body.is_none());
+    }
+
+    #[test]
     fn portable_asset_name_is_sanitized() {
         // tag 里混进路径分隔符时不能拼出目录穿越的文件名
         assert_eq!(sanitize_version("v4.13.0"), "4.13.0");
@@ -1519,5 +1842,39 @@ mod tests {
         let info = check_latest_update().expect("native WinHTTP release check should succeed");
         assert!(!info.latest_version.is_empty());
         assert!(info.download_url.is_some());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod web_fallback_live_tests {
+    use super::*;
+
+    /// 真实网络验证 web 兜底链路：跑 `cargo test --release web_fallback -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn web_fallback_fetches_real_release() {
+        let ua = format!("KuroCat/{}", CURRENT_VERSION);
+        let json = fetch_release_json_via_web_windows(&ua).expect("web 兜底失败");
+        let rel: GhRelease = serde_json::from_str(&json).expect("解析失败");
+        println!("tag: {} | 资产数: {}", rel.tag_name, rel.assets.len());
+        for a in &rel.assets {
+            println!("  {} -> {}", a.name, a.browser_download_url);
+        }
+        assert!(!rel.tag_name.is_empty());
+        assert!(!rel.assets.is_empty());
+        assert!(rel.assets.iter().all(|a| a.browser_download_url.starts_with("https://github.com/")));
+    }
+
+    /// 完整用户路径：API（当前配额耗尽会 403）失败后应自动走 web 兜底成功。
+    #[test]
+    #[ignore]
+    fn check_latest_update_survives_api_403() {
+        let info = check_latest_update().expect("检查更新整体失败");
+        println!("latest: {} | has_update: {} | asset: {:?}",
+            info.latest_version, info.has_update, info.asset_name);
+        println!("download_url: {:?}", info.download_url);
+        println!("release_url: {}", info.release_url);
+        assert!(!info.latest_version.is_empty());
+        assert!(info.download_url.is_some(), "兜底路径也应能给出下载地址");
     }
 }
