@@ -1148,6 +1148,31 @@ html[data-theme="light"] .app-card:hover {
   min-width: 138px;
 }
 
+/* 全屏播放容器：正常视图只是个普通包裹层，:fullscreen 时接管整屏 */
+.trail-player:fullscreen {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px;
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.trail-player:fullscreen .trail-stage {
+  flex: 1;
+  min-height: 0;
+  height: auto;
+  margin-bottom: 0;
+}
+
+.trail-player:fullscreen .trail-controls {
+  flex: none;
+}
+
+.trail-player:fullscreen canvas {
+  cursor: none;
+}
+
 input[type="range"] {
   appearance: none;
   flex: 1 1 180px;

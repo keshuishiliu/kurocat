@@ -273,7 +273,13 @@ export function renderLine(
 export function renderHBars(
   host: HTMLElement,
   data: Point[],
-  opts: { labelWidth?: number; rowHeight?: number; colors?: string[] } = {},
+  opts: {
+    labelWidth?: number;
+    rowHeight?: number;
+    colors?: string[];
+    /** 每行的图标 data URL（与 data 下标对应），null/undefined 该行不画图标。 */
+    icons?: (string | null)[];
+  } = {},
 ): void {
   replayers.set(host, () => renderHBars(host, data, opts));
   const rows = data.filter((d) => Number.isFinite(d.value) && d.value > 0);
@@ -291,6 +297,10 @@ export function renderHBars(
   const barMax = Math.max(40, W - labelW - valueW - 10);
   const max = Math.max(1, ...rows.map((d) => d.value));
   const maxChars = Math.max(6, Math.floor(labelW / (FONT * 0.8)));
+  // 带图标的行文字要给图标让位，可用宽度缩短
+  const ICON = 16;
+  const ICON_GAP = 5;
+  const maxCharsIcon = Math.max(4, Math.floor((labelW - ICON - ICON_GAP) / (FONT * 0.8)));
 
   const parts: string[] = [];
   parts.push(`<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img">`);
@@ -302,8 +312,16 @@ export function renderHBars(
     const ty = barY + barH / 2 + 4;
     const w = Math.max(2, (d.value / max) * barMax);
     const color = opts.colors?.[i] ?? (i === 0 ? C.accent : C.accentDim);
+    const icon = opts.icons?.[i] ?? null;
+    if (icon) {
+      parts.push(
+        `<image x="0" y="${(ty - 12).toFixed(1)}" width="${ICON}" height="${ICON}" href="${esc(icon)}"/>`,
+      );
+    }
+    const tx = icon ? ICON + ICON_GAP : 0;
+    const mc = icon ? maxCharsIcon : maxChars;
     parts.push(
-      `<text x="0" y="${ty.toFixed(1)}" fill="${C.label}" font-size="${FONT}">${esc(clip(d.label, maxChars))}</text>`,
+      `<text x="${tx}" y="${ty.toFixed(1)}" fill="${C.label}" font-size="${FONT}">${esc(clip(d.label, mc))}</text>`,
     );
     parts.push(
       `<rect x="${labelW}" y="${barY.toFixed(1)}" width="${barMax}" height="${barH}" rx="3" fill="${C.track}"/>`,

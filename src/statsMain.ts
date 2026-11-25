@@ -150,7 +150,7 @@ const DEMO_APP_META: Record<string, { name: string; version: string; path: strin
   },
   'kurocat.exe': {
     name: 'Kuro 猫猫宠',
-    version: '4.13.0',
+    version: '4.14.0',
     path: 'D:\\Programs\\kurocat\\KuroCat.exe',
   },
   'windowsterminal.exe': {
@@ -604,21 +604,31 @@ async function loadStats(): Promise<void> {
   );
   $('hour-sum').textContent = hours.length ? `${fmtNum(sumOf(hours))} 次` : '—';
 
-  const appPoints: Point[] = apps
-    .filter((r) => r.keydown > 0)
-    .slice(0, 10)
-    .map((r) => ({ label: r.label, value: r.keydown }));
-  renderHBars($('chart-app'), appPoints, { labelWidth: 200 });
-  $('app-sum').textContent = appPoints.length ? `前 ${appPoints.length}` : '—';
-
+  // 按程序排行：先用进程名出一版骨架，中文显示名与图标解析完再重画
+  const appRows = apps.filter((r) => r.keydown > 0).slice(0, 10);
   // 前台时长排行：与击键排行是两回事——看视频、读文档的程序一个键都不按，
   // 但会在这里排在前面。排序必须自己重排，不能沿用后端按「按键 + 时长」的混合序。
-  const focusPoints: Point[] = apps
+  const focusRows = apps
     .filter((r) => r.focusSeconds > 0)
     .sort((a, b) => b.focusSeconds - a.focusSeconds)
-    .slice(0, 10)
-    .map((r) => ({ label: r.label, value: Math.round(r.focusSeconds / 60) }));
-  renderHBars($('chart-focus'), focusPoints, { labelWidth: 200 });
+    .slice(0, 10);
+  const renderAppCharts = () => {
+    renderHBars(
+      $('chart-app'),
+      appRows.map((r) => ({ label: appTitle(r.label), value: r.keydown })),
+      { labelWidth: 200, icons: appRows.map((r) => metaFor(r.label)?.icon ?? null) },
+    );
+    renderHBars(
+      $('chart-focus'),
+      focusRows.map((r) => ({ label: appTitle(r.label), value: Math.round(r.focusSeconds / 60) })),
+      { labelWidth: 200, icons: focusRows.map((r) => metaFor(r.label)?.icon ?? null) },
+    );
+  };
+  renderAppCharts();
+  $('app-sum').textContent = appRows.length ? `前 ${appRows.length}` : '—';
+  if (await ensureAppMetas(apps.map((r) => r.label))) {
+    renderAppCharts();
+  }
   const focusTotal = apps.reduce((acc, r) => acc + r.focusSeconds, 0);
   $('focus-sum').textContent = focusTotal > 0 ? fmtDuration(focusTotal) : '—';
 
@@ -907,10 +917,7 @@ async function loadApps(): Promise<void> {
   // 先用进程名出一版骨架，图标和中文名解析完再重画，避免空白等待
   renderAppCategoryList();
 
-  const missing = allApps.map((r) => r.label).filter((label) => !appMetas.has(label.toLowerCase()));
-  if (missing.length) {
-    const metas = await guard(() => call<AppMeta[]>('app_meta_get', { processes: missing }));
-    for (const meta of metas ?? []) appMetas.set(meta.process.toLowerCase(), meta);
+  if (await ensureAppMetas(allApps.map((r) => r.label))) {
     renderAppCategoryList();
   }
 
@@ -920,6 +927,15 @@ async function loadApps(): Promise<void> {
     appMetaLoaded = true;
     renderAppCategoryList();
   }
+}
+
+/** 批量补齐缺失的应用元信息（中文名 / 图标），结果进 appMetas 缓存。返回是否真的拉取了新数据。 */
+async function ensureAppMetas(labels: string[]): Promise<boolean> {
+  const missing = labels.filter((label) => !appMetas.has(label.toLowerCase()));
+  if (!missing.length) return false;
+  const metas = await guard(() => call<AppMeta[]>('app_meta_get', { processes: missing }));
+  for (const meta of metas ?? []) appMetas.set(meta.process.toLowerCase(), meta);
+  return true;
 }
 
 // ---------------------------------------------------------------- 轨迹
@@ -1309,6 +1325,24 @@ function bindEvents(): void {
   ($('trail-speed') as HTMLSelectElement).addEventListener('change', (ev) => {
     const speed = Number((ev.target as HTMLSelectElement).value) || 8;
     if (trail) trail.setSpeed(speed);
+  });
+
+  // 全屏播放：舞台 + 控制条一起进全屏，Esc、双击画布或再点一次按钮退出
+  const toggleTrailFullscreen = (): void => {
+    if (document.fullscreenElement) {
+      void document.exitFullscreen();
+      return;
+    }
+    $('trail-player')
+      .requestFullscreen()
+      .catch(() => toast('当前环境不支持全屏'));
+  };
+  $('trail-fullscreen').addEventListener('click', toggleTrailFullscreen);
+  ($('trail-canvas') as HTMLCanvasElement).addEventListener('dblclick', toggleTrailFullscreen);
+  document.addEventListener('fullscreenchange', () => {
+    ($('trail-fullscreen') as HTMLButtonElement).textContent = document.fullscreenElement
+      ? '退出全屏'
+      : '全屏';
   });
 
   // 首次开启告知

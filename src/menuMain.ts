@@ -80,7 +80,7 @@ let settings: AppSettings = {
 
 let catList: CatSkinConfig[] = [...DEFAULT_BUILTIN_CATS];
 let sliderDragging = false;
-let currentAppVersion = '4.13.0';
+let currentAppVersion = '4.14.0';
 
 const menuEl = document.getElementById('context-menu') as HTMLDivElement;
 const breedPillsEl = document.getElementById('breed-pills') as HTMLDivElement;

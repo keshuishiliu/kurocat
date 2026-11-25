@@ -174,32 +174,35 @@
             </div>
           </div>
 
-          <div class="trail-stage">
-            <canvas id="trail-canvas"></canvas>
-            <div class="trail-overlay" id="trail-overlay">
-              <div class="trail-overlay-title" id="trail-overlay-title">还没有加载轨迹</div>
-              <div class="trail-overlay-desc" id="trail-overlay-desc">选一个时间范围，或者点上面的快捷按钮。</div>
+          <div class="trail-player" id="trail-player">
+            <div class="trail-stage">
+              <canvas id="trail-canvas"></canvas>
+              <div class="trail-overlay" id="trail-overlay">
+                <div class="trail-overlay-title" id="trail-overlay-title">还没有加载轨迹</div>
+                <div class="trail-overlay-desc" id="trail-overlay-desc">选一个时间范围，或者点上面的快捷按钮。</div>
+              </div>
             </div>
-          </div>
 
-          <div class="trail-controls">
-            <button class="btn primary" id="trail-play" type="button" disabled>开始</button>
-            <button class="btn" id="trail-stop" type="button" disabled>停止</button>
-            <input type="range" id="trail-progress" min="0" max="1000" value="0" />
-            <span class="trail-clock mono" id="trail-clock">--:--:--</span>
-            <label class="field-inline">
-              <span>倍速</span>
-              <select id="trail-speed">
-                <option value="1">1×</option>
-                <option value="2">2×</option>
-                <option value="4">4×</option>
-                <option value="8" selected>8×</option>
-                <option value="16">16×</option>
-                <option value="30">30×</option>
-                <option value="60">60×</option>
-                <option value="120">120×</option>
-              </select>
-            </label>
+            <div class="trail-controls">
+              <button class="btn primary" id="trail-play" type="button" disabled>开始</button>
+              <button class="btn" id="trail-stop" type="button" disabled>停止</button>
+              <input type="range" id="trail-progress" min="0" max="1000" value="0" />
+              <span class="trail-clock mono" id="trail-clock">--:--:--</span>
+              <label class="field-inline">
+                <span>倍速</span>
+                <select id="trail-speed">
+                  <option value="1">1×</option>
+                  <option value="2">2×</option>
+                  <option value="4">4×</option>
+                  <option value="8" selected>8×</option>
+                  <option value="16">16×</option>
+                  <option value="30">30×</option>
+                  <option value="60">60×</option>
+                  <option value="120">120×</option>
+                </select>
+              </label>
+              <button class="btn" id="trail-fullscreen" type="button">全屏</button>
+            </div>
           </div>
 
           <div class="note" id="trail-note">
