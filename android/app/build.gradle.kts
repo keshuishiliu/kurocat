@@ -13,8 +13,8 @@ android {
         applicationId = "com.kurocat.pet"
         minSdk = 26
         targetSdk = 35
-        versionCode = 41500
-        versionName = "4.15.0"
+        versionCode = 41501
+        versionName = "4.15.1"
     }
 
     val signingPropsFile = File("${System.getProperty("user.home")}/.kurocat-android/signing.properties")
