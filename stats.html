@@ -91,6 +91,10 @@
                 <div class="status-key">活跃判定阈值</div>
                 <div class="status-val" id="dash-gap">—</div>
               </div>
+              <div class="status-cell" id="dash-sync-cell" hidden>
+                <div class="status-key">云同步</div>
+                <div class="status-val" id="dash-sync">—</div>
+              </div>
             </div>
           </div>
 
@@ -260,6 +264,8 @@
             <input type="text" id="app-cat-filter" placeholder="搜索程序名、进程名或路径…" />
             <span class="app-search-count" id="app-cat-count"></span>
           </div>
+
+          <div class="cat-filter-row" id="app-cat-chips"></div>
 
           <div class="app-card-list" id="app-cat-list">
             <div class="chart-empty">加载中…</div>
@@ -456,6 +462,128 @@
               </div>
             </div>
           </div>
+
+          <!-- 卡片 E：数据同步 -->
+          <div class="settings-card">
+            <div class="settings-card-head">
+              <div class="settings-card-title">数据同步</div>
+              <div class="settings-card-desc">
+                在多台电脑之间合并按键与鼠标统计。走 WebDAV 网盘做中转（坚果云在
+                「安全选项 → 第三方应用管理」生成应用专用密码），两台电脑不需要同时在线。<br />
+                合并规则：计数相加，应用与分类自动对齐；本机已有的归类不会被对方覆盖。
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">自动同步</div>
+                <div class="row-desc">
+                  启动、退出与每个周期各同步一次。关闭后仍可点「立即同步」手动执行。
+                </div>
+              </div>
+              <div class="row-ctl">
+                <label class="switch">
+                  <input type="checkbox" id="sw-sync" />
+                  <span class="switch-track"></span>
+                </label>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">服务器地址</div>
+                <div class="row-desc">任何标准 WebDAV 服务都可以，默认填好了坚果云。</div>
+              </div>
+              <div class="row-ctl">
+                <input type="text" id="input-sync-server" placeholder="https://dav.jianguoyun.com/dav/" />
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">账号</div>
+                <div class="row-desc">网盘的注册邮箱或用户名。</div>
+              </div>
+              <div class="row-ctl">
+                <input type="text" id="input-sync-account" placeholder="you@example.com" />
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">应用密码</div>
+                <div class="row-desc">
+                  坚果云要用「应用专用密码」，不是登录密码。只保存在本机，不经手任何第三方。
+                </div>
+              </div>
+              <div class="row-ctl">
+                <input type="password" id="input-sync-password" placeholder="••••••••" />
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">本机名称</div>
+                <div class="row-desc">只在界面里区分两台电脑用，随便起，留空自动取主机名。</div>
+              </div>
+              <div class="row-ctl">
+                <input type="text" id="input-sync-label" placeholder="例如：台式机 / 铭凡 V3" />
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">同步周期</div>
+                <div class="row-desc">多久自动同步一次。数据量很小，选短些也不费流量。</div>
+              </div>
+              <div class="row-ctl">
+                <select id="select-sync-interval">
+                  <option value="15">15 分钟</option>
+                  <option value="30">30 分钟</option>
+                  <option value="60">1 小时</option>
+                  <option value="0">仅手动</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">云端保留天数</div>
+                <div class="row-desc">
+                  网盘上的合并包保留多久后自动清理（默认 15 天）。坚果云空间紧张就调小，
+                  但别低于对方两次开机间隔——还没被对端导入的包删掉就真没了。
+                </div>
+              </div>
+              <div class="row-ctl">
+                <input type="number" id="input-sync-retain" min="1" max="365" style="width: 90px" />
+                <span class="row-desc" style="margin-left: 6px">天</span>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">操作</div>
+                <div class="row-desc">
+                  改完账号密码先「测试连接」，再「保存」；两台电脑都配好即自动开始合并。
+                </div>
+              </div>
+              <div class="row-ctl" style="flex-wrap: wrap; justify-content: flex-end">
+                <button class="btn" id="btn-sync-test" type="button">测试连接</button>
+                <button class="btn" id="btn-sync-now" type="button">立即同步</button>
+                <button class="btn" id="btn-sync-save" type="button">保存</button>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">同步状态</div>
+                <div class="row-desc" id="sync-status">尚未配置</div>
+              </div>
+              <div class="row-ctl">
+                <span class="status-val mono" id="sync-machine">—</span>
+              </div>
+            </div>
+          </div>
         </section>
       </main>
     </div>
@@ -477,7 +605,9 @@
           <li>密码框内的一切（整段跳过，前后各多丢 300 毫秒）</li>
         </ul>
         <p>
-          数据只存在本机 <code>input-log</code> 目录，不上传、不联网。
+          数据默认只存在本机 <code>input-log</code> 目录，不上传、不联网。
+          只有你主动开启「设置 → 数据同步」，统计数据才会经你配置的网盘在自己
+          设备之间合并；记录行为本身永远是本机的。
           当前保留期：<b id="consent-retention">永久</b>。
         </p>
         <div class="modal-actions">
@@ -578,7 +708,7 @@
       </div>
     </div>
 
-    <!-- 应用归类：头部照「应用库」卡片，图标 + 名称 + 完整路径，下面直接选分类 -->
+    <!-- 应用详情：头部 + 忽略开关 + 归类 + 使用统计（键鼠汇总 / 热力图 / 趋势 / 常用键） -->
     <div class="modal-mask" id="app-cat-modal">
       <div class="modal modal-app">
         <div class="app-detail-head">
@@ -587,7 +717,9 @@
             <div class="app-detail-title">
               <span id="app-detail-name">—</span>
               <span class="app-detail-ver" id="app-detail-ver"></span>
+              <button class="btn mini" id="app-detail-rename" type="button">改名</button>
             </div>
+            <input type="text" id="app-detail-name-input" class="app-detail-name-input" maxlength="40" hidden />
             <div class="app-detail-path" id="app-detail-path">—</div>
             <div class="app-detail-actions">
               <button class="btn mini" id="app-detail-copy" type="button">复制路径</button>
@@ -595,13 +727,47 @@
             </div>
           </div>
         </div>
+
+        <div class="app-detail-ignore">
+          <div class="row-main">
+            <div class="row-title">忽略此程序</div>
+            <div class="row-desc">开启后不再记录它的新按键、点击与前台时长，统计排行里也会隐藏；已有数据保留，随时可取消。</div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="sw-app-ignored" />
+            <span class="switch-track"></span>
+          </label>
+        </div>
+
         <div class="field-label">归到哪个分类</div>
         <div class="cat-pick-grid" id="app-cat-pick"></div>
+
+        <div class="app-stats">
+          <div class="app-stats-head">
+            <div class="field-label">使用统计</div>
+            <div class="range-row" id="app-stats-range">
+              <button class="chip active" data-range="7" type="button">近 7 天</button>
+              <button class="chip" data-range="30" type="button">近 30 天</button>
+              <button class="chip" data-range="0" type="button">全部</button>
+            </div>
+          </div>
+          <div class="app-stat-cards" id="app-stat-cards"></div>
+          <div class="field-label">前台热力图 <span class="field-sub">颜色越深 = 该小时挂在前台越久</span></div>
+          <div class="app-heatmap" id="app-heatmap"><div class="chart-empty">—</div></div>
+          <div class="field-label">每日击键</div>
+          <div class="chart-body app-trend" id="app-trend"><div class="chart-empty">—</div></div>
+          <div class="field-label">最常按的键</div>
+          <div class="app-topkeys" id="app-topkeys"></div>
+        </div>
+
         <div class="modal-actions">
-          <button class="btn" id="app-cat-cancel" type="button">取消</button>
+          <button class="btn" id="app-cat-cancel" type="button">关闭</button>
         </div>
       </div>
     </div>
+
+    <!-- 应用分类快速下拉：点卡片上的分类徽标弹出，选完即改，不用进详情 -->
+    <div class="cat-quickdrop" id="cat-quickdrop" hidden></div>
 
     <div class="toast" id="toast"></div>
     <script type="module" src="/src/statsMain.ts"></script>

@@ -38,6 +38,20 @@ fn default_input_log_active_gap() -> u32 {
     5
 }
 
+// ---- 数据同步（WebDAV 直连，默认关闭） ----
+
+fn default_sync_enabled() -> bool {
+    false
+}
+
+fn default_sync_server() -> String {
+    "https://dav.jianguoyun.com/dav/".to_string()
+}
+
+fn default_sync_interval() -> u32 {
+    30
+}
+
 /// 相邻两次输入间隔不超过该分钟数，即视为连续活跃。只影响统计口径，不删除数据。
 pub fn normalize_input_log_active_gap(raw: u32) -> u32 {
     raw.clamp(1, 120)
@@ -49,6 +63,85 @@ pub fn normalize_input_log_retention(raw: u32) -> u32 {
         0 => 0,
         d => d.clamp(1, 36500),
     }
+}
+
+/// 数据同步设置。只存「连哪个网盘、多久同步一次」；
+/// 机器身份（machine_id）、水位线等同步状态都在 meta.db 里，不在这里。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncSettings {
+    #[serde(default = "default_sync_enabled")]
+    pub enabled: bool,
+    /// WebDAV 基础地址。默认坚果云；任何标准 WebDAV 服务都能用。
+    #[serde(default = "default_sync_server")]
+    pub server: String,
+    #[serde(default)]
+    pub account: String,
+    /// 网盘的「应用专用密码」，不是登录密码。
+    #[serde(default)]
+    pub password: String,
+    /// 本机显示名，只用于界面展示，云端目录用 machine_id。
+    #[serde(default)]
+    pub machine_label: String,
+    /// 自动同步周期（分钟）。0 = 仅手动。启动 / 关闭 / 手动三种时机不受此项影响，
+    /// 但都要求 enabled 打开。
+    #[serde(default = "default_sync_interval")]
+    pub interval_minutes: u32,
+    /// 云端合并包保留天数：超期旧包在每次同步后由本机自己删除（只删自己名下）。
+    /// 网盘空间有限时调小；对端没来得及导入的包删掉就真没了，别设太小。
+    #[serde(default = "default_sync_retain_days")]
+    pub retain_days: u32,
+}
+
+fn default_sync_retain_days() -> u32 {
+    15
+}
+
+impl Default for SyncSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_sync_enabled(),
+            server: default_sync_server(),
+            account: String::new(),
+            password: String::new(),
+            machine_label: String::new(),
+            interval_minutes: default_sync_interval(),
+            retain_days: default_sync_retain_days(),
+        }
+    }
+}
+
+impl SyncSettings {
+    /// 账号、密码、服务器三者齐备才算「配置完成」，才允许发起同步。
+    pub fn configured(&self) -> bool {
+        !self.server.trim().is_empty()
+            && !self.account.trim().is_empty()
+            && !self.password.is_empty()
+    }
+}
+
+/// 落盘前归一化：服务器地址补协议与结尾斜杠，账号去首尾空白，
+/// 周期限定在 15/30/60 分钟或 0（仅手动）。
+pub fn normalize_sync_settings(mut raw: SyncSettings) -> SyncSettings {
+    let mut server = raw.server.trim().to_string();
+    if !server.is_empty() && !server.starts_with("http://") && !server.starts_with("https://") {
+        server = format!("https://{server}");
+    }
+    while server.ends_with('/') {
+        server.pop();
+    }
+    raw.server = server;
+    raw.account = raw.account.trim().to_string();
+    raw.machine_label = raw.machine_label.trim().chars().take(40).collect();
+    raw.interval_minutes = match raw.interval_minutes {
+        0 => 0,
+        m if m <= 20 => 15,
+        m if m <= 45 => 30,
+        _ => 60,
+    };
+    // 云端保留期：1~365 天，默认 15
+    raw.retain_days = raw.retain_days.clamp(1, 365);
+    raw
 }
 
 pub fn default_keyboard_layout() -> String {
@@ -294,6 +387,38 @@ pub fn normalize_app_categories(
     out
 }
 
+/// 应用 → 自定义显示名。空名视为「删除自定义」，键同样trim限长。
+pub fn normalize_app_display_names(
+    raw: &std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for (app, name) in raw.iter().take(4000) {
+        let key: String = app.trim().chars().take(120).collect();
+        let val: String = name.trim().chars().take(40).collect();
+        if key.is_empty() || val.is_empty() {
+            continue;
+        }
+        out.insert(key, val);
+    }
+    out
+}
+
+/// 应用 → 忽略标记。只保留 true 的条目：false 与缺失等价，落盘前顺手清掉，
+/// 名单不会随着用户反复开关而膨胀。
+pub fn normalize_app_ignored(
+    raw: &std::collections::BTreeMap<String, bool>,
+) -> std::collections::BTreeMap<String, bool> {
+    let mut out = std::collections::BTreeMap::new();
+    for (app, ignored) in raw.iter().take(4000) {
+        let key: String = app.trim().chars().take(120).collect();
+        if key.is_empty() || !*ignored {
+            continue;
+        }
+        out.insert(key, true);
+    }
+    out
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -345,11 +470,22 @@ pub struct AppSettings {
     /// 鼠标轨迹采样。默认关闭；关闭时不落盘，开启后才建 trail.db。
     #[serde(default)]
     pub input_log_trail_recording: bool,
+    // ---- 数据同步（只由统计窗口的 sync_configure 写入） ----
+    #[serde(default)]
+    pub sync: SyncSettings,
     // ---- 分类（只由统计窗口的 categories_save 写入） ----
     #[serde(default = "default_categories")]
     pub categories: Vec<CategoryDef>,
     #[serde(default)]
     pub app_categories: std::collections::BTreeMap<String, String>,
+    // ---- 应用标注（只由统计窗口的 app_overrides_save 写入） ----
+    /// 进程名 → 用户自定义显示名。展示优先级：自定义名 > exe 显示名 > 进程名。
+    #[serde(default)]
+    pub app_display_names: std::collections::BTreeMap<String, String>,
+    /// 进程名 → true = 忽略：recorder 不再记录该程序的新数据，统计口径里也过滤掉。
+    /// 历史数据保留，取消忽略即可恢复显示。
+    #[serde(default)]
+    pub app_ignored: std::collections::BTreeMap<String, bool>,
 }
 
 impl Default for AppSettings {
@@ -383,8 +519,11 @@ impl Default for AppSettings {
             input_log_retention_days: 0,
             input_log_paused: false,
             input_log_trail_recording: false,
+            sync: SyncSettings::default(),
             categories: default_categories(),
             app_categories: std::collections::BTreeMap::new(),
+            app_display_names: std::collections::BTreeMap::new(),
+            app_ignored: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -569,8 +708,11 @@ pub fn load_settings() -> AppSettings {
                 normalize_input_log_active_gap(parsed.input_log_active_gap_minutes);
             parsed.input_log_retention_days =
                 normalize_input_log_retention(parsed.input_log_retention_days);
+            parsed.sync = normalize_sync_settings(parsed.sync);
             parsed.categories = normalize_categories(&parsed.categories);
             parsed.app_categories = normalize_app_categories(&parsed.app_categories, &parsed.categories);
+            parsed.app_display_names = normalize_app_display_names(&parsed.app_display_names);
+            parsed.app_ignored = normalize_app_ignored(&parsed.app_ignored);
             return parsed;
         }
     }

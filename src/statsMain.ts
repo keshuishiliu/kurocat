@@ -20,11 +20,20 @@ import {
   init as initCategories,
   listCategories,
   rollupByCategory,
+  rootOf,
   setAppCategory,
   subscribe,
   updateCategory,
   type Category,
 } from './categories';
+import {
+  displayNameFor,
+  init as initAppOverrides,
+  isIgnored,
+  setDisplayName,
+  setIgnored,
+  subscribe as subscribeOverrides,
+} from './appOverrides';
 import { TrailPlayer, type TrailPoint } from './trail';
 
 // --- 后端契约（对应 src-tauri/src/recorder.rs 的 Serialize 结构，camelCase） ---
@@ -75,6 +84,21 @@ interface AppActivity {
   lastDay: string;
 }
 
+/** 应用详情统计（对应 recorder.rs 的 AppStats，camelCase）。 */
+interface AppStats {
+  process: string;
+  found: boolean;
+  keydown: number;
+  mousedown: number;
+  activeSeconds: number;
+  focusSeconds: number;
+  firstDay: string | null;
+  lastDay: string | null;
+  daily: Array<{ day: string; keydown: number; mousedown: number; activeSeconds: number; focusSeconds: number }>;
+  heatmap: Array<{ day: string; hour: number; seconds: number }>;
+  topKeys: Array<{ label: string; n: number }>;
+}
+
 interface RetentionPreview {
   cutoffDay: string;
   cutoffTs: number;
@@ -91,6 +115,37 @@ interface RetentionReport {
 interface ExportResult {
   path: string;
   rows: number;
+}
+
+/** 同步配置（对应 config.rs 的 SyncSettings，camelCase）。 */
+interface SyncConfig {
+  enabled: boolean;
+  server: string;
+  account: string;
+  password: string;
+  machineLabel: string;
+  intervalMinutes: number;
+  retainDays: number;
+}
+
+/** 同步状态（对应 sync.rs 的 SyncStatus）。 */
+interface SyncStatus {
+  enabled: boolean;
+  configured: boolean;
+  intervalMinutes: number;
+  machineId: string;
+  lastSyncAt: number | null;
+  lastSyncOk: boolean | null;
+  lastSyncError: string | null;
+}
+
+/** 一次手动同步的结果（对应 sync.rs 的 SyncOutcome）。 */
+interface SyncOutcome {
+  uploaded: number;
+  imported: number;
+  skipped: number;
+  categoriesMerged: boolean;
+  warnings: string[];
 }
 
 interface TrailRangeInfo {
@@ -200,6 +255,63 @@ function demoDayAgo(n: number): string {
   const d = new Date();
   d.setDate(d.getDate() - n);
   return dayStr(d);
+}
+
+/** 演示模式的应用统计：按进程名做种子生成形状稳定的假数据，方便调 UI。 */
+function demoAppStats(process: string, from: string, to: string): AppStats {
+  const days: string[] = [];
+  const start = new Date(`${from}T00:00:00`);
+  const end = new Date(`${to}T00:00:00`);
+  if (!Number.isNaN(start.getTime()) && !Number.isNaN(end.getTime())) {
+    for (let d = new Date(start); d <= end && days.length < 45; d.setDate(d.getDate() + 1)) {
+      days.push(dayStr(d));
+    }
+  }
+  const seed = Array.from(process).reduce((a, c) => a + c.charCodeAt(0), 0);
+  const wave = (i: number) =>
+    Math.max(0, Math.round(1800 + Math.sin((seed + i) * 0.9) * 1200 + (i % 5) * 260));
+  const daily = days.map((day, i) => ({
+    day,
+    keydown: wave(i),
+    mousedown: Math.round(wave(i) / 9),
+    activeSeconds: Math.round(wave(i) / 3),
+    focusSeconds: Math.round(wave(i) / 2.2),
+  }));
+  const heatmap = days.flatMap((day, i) => {
+    const cells: Array<{ day: string; hour: number; seconds: number }> = [];
+    for (let h = 0; h < 24; h++) {
+      const secs = Math.round(
+        900 * Math.exp(-((h - 10 - (seed % 6)) ** 2) / 40) * (0.6 + Math.sin(i * 1.3 + h) * 0.4),
+      );
+      if (secs > 0) cells.push({ day, hour: h, seconds: secs });
+    }
+    return cells;
+  });
+  const keydown = daily.reduce((a, r) => a + r.keydown, 0);
+  return {
+    process,
+    found: daily.length > 0,
+    keydown,
+    mousedown: daily.reduce((a, r) => a + r.mousedown, 0),
+    activeSeconds: daily.reduce((a, r) => a + r.activeSeconds, 0),
+    focusSeconds: daily.reduce((a, r) => a + r.focusSeconds, 0),
+    firstDay: days[0] ?? null,
+    lastDay: days[days.length - 1] ?? null,
+    daily,
+    heatmap,
+    topKeys: (
+      [
+        ['Space', 0.16],
+        ['Enter', 0.11],
+        ['Backspace', 0.09],
+        ['E', 0.08],
+        ['A', 0.07],
+        ['S', 0.06],
+        ['T', 0.05],
+        ['LCtrl', 0.05],
+      ] as Array<[string, number]>
+    ).map(([label, ratio]) => ({ label, n: Math.round((keydown || 1000) * ratio) })),
+  };
 }
 
 function demoSummary(dim: string): SummaryPoint[] {
@@ -333,8 +445,43 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
     }
     case 'input_log_app_activity':
       return demoSummary('app').map((r, i) => ({ process: r.label, lastDay: demoDayAgo(i * 3) })) as unknown as T;
+    case 'input_log_app_stats':
+      return demoAppStats(String(args?.process ?? ''), String(args?.from ?? ''), String(args?.to ?? '')) as unknown as T;
     case 'open_path_folder':
       return undefined as unknown as T;
+    case 'get_settings':
+      return {
+        sync: {
+          enabled: demoEnabled,
+          server: 'https://dav.jianguoyun.com/dav/',
+          account: '',
+          password: '',
+          machineLabel: '演示机',
+          intervalMinutes: 30,
+        },
+      } as unknown as T;
+    case 'sync_configure':
+      return (args?.sync ?? {}) as unknown as T;
+    case 'sync_get_status':
+      return {
+        enabled: demoEnabled,
+        configured: false,
+        intervalMinutes: 30,
+        machineId: 'demo0123abcd5678',
+        lastSyncAt: null,
+        lastSyncOk: null,
+        lastSyncError: null,
+      } as unknown as T;
+    case 'sync_test_connection':
+      return '连接成功（演示模式）' as unknown as T;
+    case 'sync_now':
+      return {
+        uploaded: 1,
+        imported: 2,
+        skipped: 5,
+        categoriesMerged: false,
+        warnings: [],
+      } as unknown as T;
     default:
       throw new Error(`演示模式不支持 ${cmd}`);
   }
@@ -350,6 +497,12 @@ let pendingRetentionDays: number | null = null;
 let toastTimer = 0;
 let allApps: SummaryPoint[] = [];
 let appFilter = '';
+/** 分类筛选 chip：'all' = 全部，其余为顶层分类 id（含内置「未分类」）。 */
+let appCatChip = 'all';
+/** 详情弹窗统计的时间范围（天数；0 = 全部）。 */
+let appStatsRange = 7;
+/** 快速换类下拉当前挂着的程序进程名；null = 收起。 */
+let quickDropApp: string | null = null;
 /** 进程名（小写）→ 图标 / 中文名 / 路径 / 版本 */
 let appMetas = new Map<string, AppMeta>();
 /** 进程名（小写）→ 最后一次有记录的日期 */
@@ -583,6 +736,9 @@ async function loadStats(): Promise<void> {
   const hours = hoursRaw ?? [];
   const apps = appsRaw ?? [];
   const keys = keysRaw ?? [];
+  // 忽略的程序不进统计口径：新数据本来就不会再产生，历史数据也一并隐藏
+  // （明细保留在库里，取消忽略即可恢复显示）。
+  const appsVisible = apps.filter((r) => !isIgnored(r.label));
 
   const trendPoints: Point[] = trend.map((r) => ({
     label: shortLabel(r.label, dim),
@@ -605,10 +761,10 @@ async function loadStats(): Promise<void> {
   $('hour-sum').textContent = hours.length ? `${fmtNum(sumOf(hours))} 次` : '—';
 
   // 按程序排行：先用进程名出一版骨架，中文显示名与图标解析完再重画
-  const appRows = apps.filter((r) => r.keydown > 0).slice(0, 10);
+  const appRows = appsVisible.filter((r) => r.keydown > 0).slice(0, 10);
   // 前台时长排行：与击键排行是两回事——看视频、读文档的程序一个键都不按，
   // 但会在这里排在前面。排序必须自己重排，不能沿用后端按「按键 + 时长」的混合序。
-  const focusRows = apps
+  const focusRows = appsVisible
     .filter((r) => r.focusSeconds > 0)
     .sort((a, b) => b.focusSeconds - a.focusSeconds)
     .slice(0, 10);
@@ -626,14 +782,14 @@ async function loadStats(): Promise<void> {
   };
   renderAppCharts();
   $('app-sum').textContent = appRows.length ? `前 ${appRows.length}` : '—';
-  if (await ensureAppMetas(apps.map((r) => r.label))) {
+  if (await ensureAppMetas(appsVisible.map((r) => r.label))) {
     renderAppCharts();
   }
-  const focusTotal = apps.reduce((acc, r) => acc + r.focusSeconds, 0);
+  const focusTotal = appsVisible.reduce((acc, r) => acc + r.focusSeconds, 0);
   $('focus-sum').textContent = focusTotal > 0 ? fmtDuration(focusTotal) : '—';
 
   // 分类汇总：子分类并入顶层，颜色直接取分类色
-  const rolled = rollupByCategory(apps.map((r) => ({ app: r.label, value: r.keydown })));
+  const rolled = rollupByCategory(appsVisible.map((r) => ({ app: r.label, value: r.keydown })));
   const catPoints: Point[] = rolled.map((r) => ({
     label: `${r.category.icon} ${r.category.name}`,
     value: r.value,
@@ -644,7 +800,7 @@ async function loadStats(): Promise<void> {
   });
   $('cat-sum').textContent = catPoints.length ? `${catPoints.length} 类` : '—';
 
-  const unmapped = apps.filter((r) => r.keydown > 0 && categoryForApp(r.label).id === 'uncat').length;
+  const unmapped = appsVisible.filter((r) => r.keydown > 0 && categoryForApp(r.label).id === 'uncat').length;
   const noteEl = $('stats-cat-note');
   if (unmapped > 0) {
     noteEl.hidden = false;
@@ -774,8 +930,10 @@ function metaFor(label: string): AppMeta | undefined {
   return appMetas.get(label.toLowerCase());
 }
 
-/** 展示名：优先软件自带的名字（微信、QQ、360压缩），没有就退回去掉扩展名的进程名。 */
+/** 展示名：自定义名（详情弹窗里改的）优先，其次软件自带的名字，最后退回进程名。 */
 function appTitle(label: string): string {
+  const custom = displayNameFor(label);
+  if (custom) return custom;
   const name = metaFor(label)?.displayName?.trim();
   if (name) return name;
   return label.replace(/\.exe$/i, '');
@@ -803,16 +961,42 @@ function lastSeenText(process: string): string {
   return `${Math.floor(diff / 365)} 年前`;
 }
 
+/** 分类筛选 chips：全部 + 各顶层分类，带应用计数。 */
+function renderAppCatChips(): void {
+  const host = $('app-cat-chips');
+  const candidates = allApps.filter((r) => r.keydown + r.mousedown > 0);
+  const countFor = (id: string) =>
+    candidates.filter((r) => rootOf(categoryForApp(r.label).id).id === id).length;
+  const chip = (id: string, label: string, color: string | null) => {
+    const n = id === 'all' ? candidates.length : countFor(id);
+    return (
+      `<button class="chip cat-chip${appCatChip === id ? ' active' : ''}" data-chip="${escapeHtml(id)}" type="button">` +
+      (color ? `<i class="cat-chip-dot" style="background:${escapeHtml(color)}"></i>` : '') +
+      `${escapeHtml(label)}<b>${n}</b></button>`
+    );
+  };
+  const parts: string[] = [chip('all', '全部', null)];
+  for (const c of listCategories().filter((x) => !x.parentId)) {
+    parts.push(chip(c.id, `${c.icon} ${c.name}`, c.color));
+  }
+  host.innerHTML = parts.join('');
+}
+
 function renderAppCategoryList(): void {
   const host = $('app-cat-list');
   const filter = appFilter.trim().toLowerCase();
   const candidates = allApps.filter((r) => r.keydown + r.mousedown > 0);
   const rows = candidates.filter((r) => {
+    if (appCatChip !== 'all' && rootOf(categoryForApp(r.label).id).id !== appCatChip) return false;
     if (!filter) return true;
     const meta = metaFor(r.label);
-    const hay = [r.label, meta?.displayName ?? '', meta?.exePath ?? ''].join(' ').toLowerCase();
+    const hay = [r.label, meta?.displayName ?? '', meta?.exePath ?? '', displayNameFor(r.label) ?? '']
+      .join(' ')
+      .toLowerCase();
     return hay.includes(filter);
   });
+
+  renderAppCatChips();
 
   const countEl = $('app-cat-count');
   countEl.textContent = candidates.length ? `${rows.length} / ${candidates.length} 个程序` : '';
@@ -820,7 +1004,9 @@ function renderAppCategoryList(): void {
   if (!rows.length) {
     host.innerHTML = filter
       ? '<div class="chart-empty">没有匹配的程序。</div>'
-      : '<div class="chart-empty">还没有可归类的程序，先打开「记录输入」攒一点数据。</div>';
+      : appCatChip !== 'all'
+        ? '<div class="chart-empty">这个分类下还没有程序，点上面的「全部」看看。</div>'
+        : '<div class="chart-empty">还没有可归类的程序，先打开「记录输入」攒一点数据。</div>';
     return;
   }
 
@@ -841,8 +1027,11 @@ function renderAppCategoryList(): void {
       if (r.focusSeconds > 0) durParts.push(`前台 ${fmtDuration(r.focusSeconds)}`);
       if (r.activeSeconds > 0) durParts.push(`活跃 ${fmtDuration(r.activeSeconds)}`);
       const duration = durParts.length ? durParts.join(' · ') : '暂无计时';
+      const ignoredBadge = isIgnored(r.label)
+        ? '<span class="app-ignored-badge" title="已忽略：不再记录新数据，统计里也隐藏">已忽略</span>'
+        : '';
       return (
-        `<div class="app-card" data-app="${escapeHtml(r.label)}" role="button" tabindex="0">` +
+        `<div class="app-card${isIgnored(r.label) ? ' ignored' : ''}" data-app="${escapeHtml(r.label)}" role="button" tabindex="0">` +
         `<div class="app-card-icon">${icon}</div>` +
         '<div class="app-card-main">' +
         '<div class="app-card-line">' +
@@ -853,9 +1042,9 @@ function renderAppCategoryList(): void {
           path || '未记录路径（程序没在运行，注册表里也没登记）',
         )}</div>` +
         '<div class="app-card-foot">' +
-        `<span class="app-cat-badge" style="--cat-color:${escapeHtml(cat.color)}"><i></i>${escapeHtml(
-          cat.name,
-        )}</span>` +
+        `<button class="app-cat-badge badge-btn" data-act="badge" style="--cat-color:${escapeHtml(cat.color)}" title="点击快速更换分类">` +
+        `<i></i>${escapeHtml(cat.name)}</button>` +
+        ignoredBadge +
         '<span class="app-card-sep">·</span>' +
         `<span>${escapeHtml(duration)}</span>` +
         (seen ? `<span class="app-card-sep">·</span><span>${escapeHtml(seen)}</span>` : '') +
@@ -904,8 +1093,165 @@ function openAppCategoryModal(app: string): void {
   ($('app-detail-copy') as HTMLButtonElement).disabled = !path;
   ($('app-detail-reveal') as HTMLButtonElement).disabled = !path;
 
+  // 改名输入框复位：每次打开都是「显示态」，点「改名」才进入编辑
+  const nameInput = $('app-detail-name-input') as HTMLInputElement;
+  nameInput.hidden = true;
+  nameInput.value = '';
+  $('app-detail-name').hidden = false;
+  ($('app-detail-rename') as HTMLButtonElement).textContent = '改名';
+
+  // 忽略开关同步当前状态
+  ($('sw-app-ignored') as HTMLInputElement).checked = isIgnored(app);
+
   renderCategoryPicker(app);
   showModal('app-cat-modal');
+  void loadAppStats();
+}
+
+// ---------------------------------------------------------------- 快速换类
+
+function closeCatQuickDrop(): void {
+  const drop = $('cat-quickdrop');
+  drop.hidden = true;
+  quickDropApp = null;
+}
+
+/** 点卡片上的分类徽标：在徽标正下方弹一个分类下拉，选完即改，不用进详情。 */
+function openCatQuickDrop(app: string, anchor: HTMLElement): void {
+  const drop = $('cat-quickdrop');
+  if (quickDropApp === app && !drop.hidden) {
+    closeCatQuickDrop();
+    return;
+  }
+  quickDropApp = app;
+  const cats = listCategories();
+  const currentId = categoryForApp(app).id;
+  const button = (id: string, color: string, label: string, child = false) =>
+    `<button class="cat-pick${id === currentId ? ' active' : ''}${child ? ' child' : ''}" ` +
+    `data-cat="${escapeHtml(id)}" type="button"><i style="background:${escapeHtml(color)}"></i>` +
+    `${escapeHtml(label)}</button>`;
+
+  const parts: string[] = [];
+  for (const root of cats.filter((c) => !c.parentId)) {
+    parts.push(button(root.id, root.color, `${root.icon} ${root.name}`));
+    for (const child of cats.filter((c) => c.parentId === root.id)) {
+      parts.push(button(child.id, child.color, `${child.icon} ${child.name}`, true));
+    }
+  }
+  drop.innerHTML =
+    `<div class="cat-quickdrop-title">${escapeHtml(appTitle(app))} 归到哪个分类</div>` +
+    parts.join('');
+  drop.hidden = false;
+
+  // 定位：贴着徽标往下放，靠右/靠下放不下时往回收
+  const rect = anchor.getBoundingClientRect();
+  const dropW = drop.offsetWidth;
+  const dropH = drop.offsetHeight;
+  let x = rect.left;
+  let y = rect.bottom + 6;
+  if (x + dropW > window.innerWidth - 8) x = Math.max(8, window.innerWidth - dropW - 8);
+  if (y + dropH > window.innerHeight - 8) y = Math.max(8, rect.top - dropH - 6);
+  drop.style.left = `${x}px`;
+  drop.style.top = `${y}px`;
+}
+
+// ---------------------------------------------------------------- 应用详情统计
+
+async function loadAppStats(): Promise<void> {
+  const app = editingApp;
+  if (!app) return;
+  const to = dayStr(new Date());
+  const from = appStatsRange === 0 ? (status?.firstDay ?? to) : daysAgoInclusive(appStatsRange);
+  $('app-stat-cards').innerHTML = '<div class="chart-empty">加载中…</div>';
+  $('app-heatmap').innerHTML = '<div class="chart-empty">加载中…</div>';
+  const st = await guard(() => call<AppStats>('input_log_app_stats', { process: app, from, to }));
+  // 弹窗已经切到别的程序（或已关闭）就别再往界面上写了
+  if (!st || editingApp !== app) return;
+
+  if (!st.found) {
+    $('app-stat-cards').innerHTML = '<div class="chart-empty">这个程序还没有统计数据。</div>';
+    $('app-heatmap').innerHTML = '<div class="chart-empty">暂无前台时长数据。</div>';
+    renderBars($('app-trend'), [], { height: 130, maxLabels: 8 });
+    $('app-topkeys').innerHTML = '<div class="chart-empty">暂无按键数据。</div>';
+    return;
+  }
+
+  const card = (label: string, value: string) =>
+    `<div class="app-stat-card"><div class="app-stat-label">${escapeHtml(label)}</div>` +
+    `<div class="app-stat-value">${escapeHtml(value)}</div></div>`;
+  $('app-stat-cards').innerHTML =
+    card('击键', fmtNum(st.keydown)) +
+    card('鼠标点击', fmtNum(st.mousedown)) +
+    card('活跃时长', fmtDuration(st.activeSeconds)) +
+    card('前台时长', fmtDuration(st.focusSeconds));
+
+  renderAppHeatmap(st.heatmap);
+  renderBars(
+    $('app-trend'),
+    st.daily.map((d) => ({ label: d.day.slice(5), value: d.keydown })),
+    { height: 130, maxLabels: 8 },
+  );
+  renderAppTopKeys(st.topKeys);
+}
+
+/** 热力图：行 = 天，列 = 0~23 点，颜色深浅 = 该程序这个小时挂在前台的秒数。 */
+function renderAppHeatmap(cells: AppStats['heatmap']): void {
+  const host = $('app-heatmap');
+  if (!cells.length) {
+    host.innerHTML = '<div class="chart-empty">该范围内没有前台时长数据。</div>';
+    return;
+  }
+  const max = Math.max(...cells.map((c) => c.seconds), 1);
+  const byKey = new Map(cells.map((c) => [`${c.day}|${c.hour}`, c.seconds]));
+  const days = Array.from(new Set(cells.map((c) => c.day))).sort();
+  // 开方拉伸：1 小时挂满和 5 分钟挂一下在视觉上也能拉开层次。
+  // 颜色用主题 accent 的 RGB，深浅两个主题都成立。
+  const color = (secs: number): string => {
+    const t = Math.sqrt(Math.min(1, secs / max));
+    const alpha = 0.14 + t * 0.86;
+    return `rgba(126, 166, 255, ${alpha.toFixed(3)})`;
+  };
+  const parts: string[] = ['<div class="hm-grid">'];
+  parts.push('<div class="hm-hours"><span></span>');
+  for (let h = 0; h < 24; h++) {
+    parts.push(`<span>${h % 3 === 0 ? String(h).padStart(2, '0') : ''}</span>`);
+  }
+  parts.push('</div>');
+  for (const day of days) {
+    parts.push(
+      `<div class="hm-row"><span class="hm-day" title="${escapeHtml(day)}">${escapeHtml(day.slice(5))}</span><div class="hm-cells">`,
+    );
+    for (let h = 0; h < 24; h++) {
+      const secs = byKey.get(`${day}|${h}`) ?? 0;
+      const style = secs > 0 ? ` style="background:${color(secs)}"` : '';
+      parts.push(
+        `<span class="hm-cell${secs > 0 ? '' : ' empty'}"${style} title="${escapeHtml(
+          `${day} ${String(h).padStart(2, '0')}:00 · ${secs > 0 ? fmtDuration(secs) : '无记录'}`,
+        )}"></span>`,
+      );
+    }
+    parts.push('</div></div>');
+  }
+  parts.push('</div>');
+  host.innerHTML = parts.join('');
+}
+
+/** 该程序的 top 按键：轻量横条，不进图表登记表（弹窗一关就没了）。 */
+function renderAppTopKeys(keys: AppStats['topKeys']): void {
+  const host = $('app-topkeys');
+  if (!keys.length) {
+    host.innerHTML = '<div class="chart-empty">暂无按键数据。</div>';
+    return;
+  }
+  const max = Math.max(...keys.map((k) => k.n), 1);
+  host.innerHTML = keys
+    .map(
+      (k) =>
+        `<div class="topkey-row"><span class="topkey-name">${escapeHtml(k.label)}</span>` +
+        `<div class="topkey-bar"><i style="width:${Math.max(4, Math.round((k.n / max) * 100))}%"></i></div>` +
+        `<span class="topkey-n">${fmtNum(k.n)}</span></div>`,
+    )
+    .join('');
 }
 
 async function loadApps(): Promise<void> {
@@ -1114,6 +1460,109 @@ async function doExport(): Promise<void> {
   toast(`已导出 ${fmtNum(result.rows)} 条到 ${result.path}`);
 }
 
+// ---------------------------------------------------------------- 数据同步
+
+let syncStatus: SyncStatus | null = null;
+
+function fillSyncForm(cfg: SyncConfig): void {
+  ($('sw-sync') as HTMLInputElement).checked = cfg.enabled;
+  ($('input-sync-server') as HTMLInputElement).value = cfg.server;
+  ($('input-sync-account') as HTMLInputElement).value = cfg.account;
+  ($('input-sync-password') as HTMLInputElement).value = cfg.password;
+  ($('input-sync-label') as HTMLInputElement).value = cfg.machineLabel;
+  ($('select-sync-interval') as HTMLSelectElement).value = String(cfg.intervalMinutes);
+  ($('input-sync-retain') as HTMLInputElement).value = String(cfg.retainDays);
+}
+
+function collectSyncConfig(): SyncConfig {
+  return {
+    enabled: ($('sw-sync') as HTMLInputElement).checked,
+    server: ($('input-sync-server') as HTMLInputElement).value.trim(),
+    account: ($('input-sync-account') as HTMLInputElement).value.trim(),
+    password: ($('input-sync-password') as HTMLInputElement).value,
+    machineLabel: ($('input-sync-label') as HTMLInputElement).value.trim(),
+    intervalMinutes: Number(($('select-sync-interval') as HTMLSelectElement).value) || 0,
+    retainDays: Math.max(1, Math.min(365, Number(($('input-sync-retain') as HTMLInputElement).value) || 15)),
+  };
+}
+
+function renderSyncStatus(st: SyncStatus): void {
+  syncStatus = st;
+  const el = $('sync-status');
+  if (!st.configured) {
+    el.textContent = '尚未配置：填好服务器、账号和应用密码，点「测试连接」验证';
+  } else if (st.lastSyncAt == null) {
+    el.textContent = '已配置，等待首次同步（启动 / 退出 / 到点各试一次）';
+  } else if (st.lastSyncOk) {
+    el.textContent = `上次同步 ${timeStr(st.lastSyncAt)}：成功`;
+  } else {
+    el.textContent = `上次同步 ${timeStr(st.lastSyncAt)}：失败（${st.lastSyncError ?? '未知原因'}）`;
+  }
+  $('sync-machine').textContent =
+    st.machineId === '—' ? '未生成' : `本机 ID ${st.machineId.slice(0, 8)}`;
+
+  ($('sw-sync') as HTMLInputElement).checked = st.enabled;
+
+  // 仪表盘徽标：只在开启且配置完整时露面
+  const cell = $('dash-sync-cell');
+  if (st.enabled && st.configured) {
+    cell.hidden = false;
+    $('dash-sync').textContent =
+      st.lastSyncAt == null
+        ? '待首次同步'
+        : st.lastSyncOk
+          ? `✓ ${timeStr(st.lastSyncAt)}`
+          : `✗ ${timeStr(st.lastSyncAt)}`;
+  } else {
+    cell.hidden = true;
+  }
+}
+
+async function refreshSyncStatus(): Promise<void> {
+  const st = await guard(() => call<SyncStatus>('sync_get_status'));
+  if (st) renderSyncStatus(st);
+}
+
+async function loadSyncConfig(): Promise<void> {
+  const s = await guard(() => call<{ sync: SyncConfig }>('get_settings'));
+  if (s?.sync) fillSyncForm(s.sync);
+  await refreshSyncStatus();
+}
+
+async function saveSync(): Promise<void> {
+  const cfg = collectSyncConfig();
+  const saved = await guard(() => call<SyncConfig>('sync_configure', { sync: cfg }));
+  if (!saved) return;
+  toast(saved.enabled ? '同步设置已保存，正在按新配置执行' : '同步设置已保存');
+  await refreshSyncStatus();
+}
+
+async function testSync(): Promise<void> {
+  const cfg = collectSyncConfig();
+  toast('正在测试连接…');
+  const msg = await guard(() => call<string>('sync_test_connection', { sync: cfg }));
+  if (msg) toast(msg);
+}
+
+async function syncNow(): Promise<void> {
+  const btn = $('btn-sync-now') as HTMLButtonElement;
+  if (btn.disabled) return;
+  btn.disabled = true;
+  try {
+    const out = await guard(() => call<SyncOutcome>('sync_now'));
+    if (out) {
+      const parts = [`上传 ${out.uploaded} 包`, `导入 ${out.imported} 包`];
+      if (out.skipped) parts.push(`已同步过 ${out.skipped} 包`);
+      if (out.categoriesMerged) parts.push('分类与标注已合并');
+      if (out.warnings.length) parts.push(`警告 ${out.warnings.length} 条`);
+      toast(`同步完成：${parts.join('，')}`);
+      await refreshSyncStatus();
+    }
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 // ---------------------------------------------------------------- 页面切换
 
 function switchPage(page: string): void {
@@ -1190,6 +1639,15 @@ function bindEvents(): void {
   $('btn-export').addEventListener('click', () => void doExport());
   $('btn-clear').addEventListener('click', () => void requestClear());
 
+  // ---- 数据同步 ----
+  $('btn-sync-save').addEventListener('click', () => void saveSync());
+  $('btn-sync-test').addEventListener('click', () => void testSync());
+  $('btn-sync-now').addEventListener('click', () => void syncNow());
+  // 开关切换 = 立即按当前表单保存（与其它开关「改动立即生效」的行为一致）
+  ($('sw-sync') as HTMLInputElement).addEventListener('change', () => {
+    void saveSync();
+  });
+
   // ---- 分类 ----
   $('btn-cat-new').addEventListener('click', () => openCategoryModal(null));
 
@@ -1245,8 +1703,23 @@ function bindEvents(): void {
     renderAppCategoryList();
   });
 
+  $('app-cat-chips').addEventListener('click', (ev) => {
+    const btn = (ev.target as HTMLElement).closest<HTMLButtonElement>('.chip');
+    if (!btn?.dataset.chip) return;
+    appCatChip = btn.dataset.chip;
+    renderAppCategoryList();
+  });
+
   $('app-cat-list').addEventListener('click', (ev) => {
-    const card = (ev.target as HTMLElement).closest<HTMLElement>('.app-card');
+    const target = ev.target as HTMLElement;
+    // 点分类徽标 = 快速换类下拉；点卡片其余部分 = 详情弹窗
+    const badge = target.closest<HTMLElement>('.app-cat-badge');
+    if (badge) {
+      const card = badge.closest<HTMLElement>('.app-card');
+      if (card?.dataset.app) openCatQuickDrop(card.dataset.app, badge);
+      return;
+    }
+    const card = target.closest<HTMLElement>('.app-card');
     if (!card?.dataset.app) return;
     openAppCategoryModal(card.dataset.app);
   });
@@ -1257,6 +1730,24 @@ function bindEvents(): void {
     if (!card?.dataset.app) return;
     ev.preventDefault();
     openAppCategoryModal(card.dataset.app);
+  });
+
+  $('cat-quickdrop').addEventListener('click', (ev) => {
+    const btn = (ev.target as HTMLElement).closest<HTMLElement>('.cat-pick');
+    if (!btn?.dataset.cat || !quickDropApp) return;
+    const target = quickDropApp;
+    setAppCategory(target, btn.dataset.cat);
+    toast(`已把 ${appTitle(target)} 归到「${categoryForApp(target).name}」`);
+    closeCatQuickDrop();
+    renderAppCategoryList();
+  });
+
+  // 点下拉以外的任何地方都收起（徽标自己的点击由上面的监听处理，不会到这里）
+  document.addEventListener('click', (ev) => {
+    if (quickDropApp === null) return;
+    const target = ev.target as HTMLElement;
+    if (target.closest('#cat-quickdrop') || target.closest('.app-cat-badge')) return;
+    closeCatQuickDrop();
   });
 
   $('app-cat-pick').addEventListener('click', (ev) => {
@@ -1288,6 +1779,64 @@ function bindEvents(): void {
     const path = editingApp ? metaFor(editingApp)?.exePath : null;
     if (!path) return;
     void guard(() => call('open_path_folder', { path }));
+  });
+
+  // 改名：点「改名」进入编辑，再点「保存」（或回车）生效；清空 = 恢复软件默认名
+  $('app-detail-rename').addEventListener('click', () => {
+    const app = editingApp;
+    if (!app) return;
+    const btn = $('app-detail-rename') as HTMLButtonElement;
+    const input = $('app-detail-name-input') as HTMLInputElement;
+    const nameSpan = $('app-detail-name');
+    if (input.hidden) {
+      // 预填当前生效的展示名（自定义名优先，其次 exe 名）
+      input.value = appTitle(app);
+      nameSpan.hidden = true;
+      input.hidden = false;
+      btn.textContent = '保存';
+      input.focus();
+      input.select();
+      return;
+    }
+    const val = input.value.trim();
+    setDisplayName(app, val);
+    nameSpan.textContent = appTitle(app);
+    nameSpan.hidden = false;
+    input.hidden = true;
+    btn.textContent = '改名';
+    toast(val ? '显示名已更新' : '已清除自定义名，恢复软件默认名');
+    renderAppCategoryList();
+  });
+  ($('app-detail-name-input') as HTMLInputElement).addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Enter') return;
+    ev.preventDefault();
+    ($('app-detail-rename') as HTMLButtonElement).click();
+  });
+
+  // 忽略开关：只影响新数据与统计口径，历史数据保留
+  ($('sw-app-ignored') as HTMLInputElement).addEventListener('change', (ev) => {
+    const app = editingApp;
+    if (!app) return;
+    const on = (ev.target as HTMLInputElement).checked;
+    setIgnored(app, on);
+    toast(
+      on
+        ? `已忽略 ${appTitle(app)}：不再记录它的新数据，统计里也会隐藏`
+        : `已取消忽略 ${appTitle(app)}`,
+    );
+    renderAppCategoryList();
+    if (document.getElementById('page-stats')?.classList.contains('active')) void loadStats();
+  });
+
+  // 详情统计的时间范围
+  $('app-stats-range').addEventListener('click', (ev) => {
+    const btn = (ev.target as HTMLElement).closest<HTMLButtonElement>('.chip');
+    if (!btn?.dataset.range) return;
+    appStatsRange = Number(btn.dataset.range);
+    document.querySelectorAll<HTMLButtonElement>('#app-stats-range .chip').forEach((c) => {
+      c.classList.toggle('active', c === btn);
+    });
+    void loadAppStats();
   });
 
   // ---- 轨迹 ----
@@ -1403,6 +1952,7 @@ function bindEvents(): void {
       pendingRetentionDays = null;
       editingCatId = null;
       pendingDeleteCatId = null;
+      closeCatQuickDrop();
     }
   });
 
@@ -1420,16 +1970,23 @@ async function boot(): Promise<void> {
   applyTheme();
   bindSystemTheme();
   bindEvents();
-  // 分类存在 settings.json 里，先把权威版本拉回来再渲染任何列表
-  await initCategories();
+  // 分类与应用标注存在 settings.json 里，先把权威版本拉回来再渲染任何列表
+  await Promise.all([initCategories(), initAppOverrides()]);
   // 分类变了（新增/删除/归类），统计图与两个列表都要跟着变
   subscribe(() => {
     renderCategoryList();
     renderAppCategoryList();
     if (document.getElementById('page-stats')?.classList.contains('active')) void loadStats();
   });
+  // 自定义名 / 忽略变了：列表立即重画（改名会变标题，忽略会影响统计口径）
+  subscribeOverrides(() => {
+    renderAppCategoryList();
+    if (document.getElementById('page-stats')?.classList.contains('active')) void loadStats();
+  });
 
   await refreshStatus();
+  // 同步配置与状态独立于 LogStatus，单独拉一次
+  void loadSyncConfig();
 
   // 调试用：stats.html?page=stats 直接打开某一页
   const wanted = new URLSearchParams(location.search).get('page');
@@ -1440,6 +1997,7 @@ async function boot(): Promise<void> {
   if (HAS_TAURI) {
     void listen('kuro-settings', () => {
       void refreshStatus();
+      void refreshSyncStatus();
     });
     void listen('kuro-input-log-cleaned', () => {
       void refreshStatus();
@@ -1450,6 +2008,7 @@ async function boot(): Promise<void> {
   window.setInterval(() => {
     if (document.visibilityState === 'visible' && document.getElementById('page-dashboard')?.classList.contains('active')) {
       void refreshStatus();
+      void refreshSyncStatus();
     }
   }, 30_000);
 }

@@ -49,6 +49,13 @@ interface PendingPortableUpdate {
   sha256: string | null;
 }
 
+/** Rust 侧 `kuro-update-status` 广播的更新进度事件。 */
+interface UpdateProgressEvent {
+  stage: 'checking' | 'available' | 'downloading' | 'verifying' | 'installing' | 'ready' | 'up_to_date' | 'error';
+  message: string;
+  info: UpdateInfo | null;
+}
+
 const TAIL_MODE_LABELS: Record<TailKeyMode, string> = {
   smart: '智能第三只手',
   custom: '自定义按键',
@@ -81,6 +88,29 @@ let settings: AppSettings = {
 let catList: CatSkinConfig[] = [...DEFAULT_BUILTIN_CATS];
 let sliderDragging = false;
 let currentAppVersion = '4.14.0';
+
+// 更新流程状态：菜单窗口与宠物窗口共用 Rust 侧同一套 install_update 管线。
+let updateBusy = false;
+let latestUpdateInfo: UpdateInfo | null = null;
+let hintRestoreTimer: number | null = null;
+
+const updateHintEl = document.getElementById('update-hint') as HTMLSpanElement;
+
+function setUpdateHint(text: string, ready = false): void {
+  if (!updateHintEl) return;
+  updateHintEl.textContent = text;
+  updateHintEl.classList.toggle('copied', ready);
+}
+
+/** 延时把版本徽标恢复成当前版本号（ready 状态不被覆盖）。 */
+function restoreHintLater(ms: number): void {
+  if (hintRestoreTimer !== null) window.clearTimeout(hintRestoreTimer);
+  hintRestoreTimer = window.setTimeout(() => {
+    hintRestoreTimer = null;
+    if (!updateHintEl || updateHintEl.classList.contains('copied')) return;
+    updateHintEl.textContent = `v${currentAppVersion}`;
+  }, ms);
+}
 
 const menuEl = document.getElementById('context-menu') as HTMLDivElement;
 const breedPillsEl = document.getElementById('breed-pills') as HTMLDivElement;
@@ -279,43 +309,63 @@ async function createDesktopShortcut(): Promise<void> {
   }
 }
 
+function startInstallUpdate(info: UpdateInfo): void {
+  updateBusy = true;
+  setUpdateHint('下载中…');
+  // 成功路径由 kuro-update-status 事件驱动（downloading/verifying/installing/ready）。
+  void invoke('install_update', { info }).catch((msg) => {
+    updateBusy = false;
+    console.error('Update install failed:', msg);
+    setUpdateHint('更新失败');
+    restoreHintLater(4000);
+  });
+}
+
 async function triggerManualUpdateCheck(): Promise<void> {
-  const hint = document.getElementById('update-hint');
-  if (hint) hint.textContent = '检查中…';
+  if (updateBusy) return;
   // 绿色版：已经有下载好的包时，这一项直接变成「应用并重启」，不再走网络检查。
   try {
     const pending = await invoke<PendingPortableUpdate | null>('get_pending_update');
     if (pending?.version) {
-      if (hint) hint.textContent = '应用更新中…';
+      setUpdateHint('应用更新中…');
       await invoke('apply_portable_update');
       return;
     }
   } catch {
     // 没有待更新包，继续正常检查
   }
+  // 上一轮已经发现过新版本：这次点击直接开始下载安装，不再重复检查。
+  if (latestUpdateInfo?.hasUpdate && latestUpdateInfo.downloadUrl) {
+    startInstallUpdate(latestUpdateInfo);
+    return;
+  }
+  updateBusy = true;
+  setUpdateHint('检查中…');
   try {
     const info = await invoke<UpdateInfo>('check_for_update');
-    if (info.hasUpdate) {
-      if (hint) {
-        hint.textContent = `发现 v${info.latestVersion}`;
-        hint.classList.add('copied');
-      }
-      if (info.releaseUrl) {
-        void invoke('open_release_page', { url: info.releaseUrl });
-      }
-    } else if (hint) {
-      hint.textContent = `最新 v${info.currentVersion}`;
-      setTimeout(() => {
-        hint.textContent = `v${currentAppVersion}`;
-      }, 2200);
+    latestUpdateInfo = info;
+    if (!info.hasUpdate) {
+      updateBusy = false;
+      setUpdateHint(`✓ 最新 v${info.currentVersion}`);
+      restoreHintLater(2200);
+      return;
     }
+    if (info.downloadUrl) {
+      // 与宠物窗口一致：发现新版本直接自动下载安装，不跳浏览器。
+      startInstallUpdate(info);
+      return;
+    }
+    // 找不到匹配的更新包（Win7 兼容版 / 手动安装场景）：退回打开发布页。
+    updateBusy = false;
+    setUpdateHint(`发现 v${info.latestVersion}`);
+    if (info.releaseUrl) {
+      void invoke('open_release_page', { url: info.releaseUrl });
+    }
+    restoreHintLater(4000);
   } catch {
-    if (hint) {
-      hint.textContent = '检查失败';
-      setTimeout(() => {
-        hint.textContent = `v${currentAppVersion}`;
-      }, 2200);
-    }
+    updateBusy = false;
+    setUpdateHint('检查失败');
+    restoreHintLater(2200);
   }
 }
 
@@ -493,6 +543,44 @@ async function bootstrap(): Promise<void> {
   await listen<AppSettings>('kuro-settings', (ev) => {
     settings = ev.payload;
     syncUI();
+  });
+
+  // 更新进度：只响应菜单窗口自己发起的 install_update 流程（updateBusy 期间），
+  // 宠物窗口 / 托盘触发的更新事件不去抢，避免两边同时下载。
+  await listen<UpdateProgressEvent>('kuro-update-status', (ev) => {
+    if (!updateBusy) return;
+    const { stage, message, info } = ev.payload;
+    const ver = info?.latestVersion;
+    switch (stage) {
+      case 'downloading':
+        setUpdateHint(`⬇ v${ver} 下载中…`);
+        break;
+      case 'verifying':
+        setUpdateHint('校验中…');
+        break;
+      case 'installing':
+        // 绿色版「应用并重启」路径的 installing 事件不带 info。
+        setUpdateHint(ver ? `安装 v${ver} 中…` : '应用更新中…');
+        break;
+      case 'ready':
+        updateBusy = false;
+        if (info) latestUpdateInfo = info;
+        setUpdateHint(`⟳ v${ver} 待重启`, true);
+        break;
+      case 'up_to_date':
+        updateBusy = false;
+        setUpdateHint(`✓ 最新 v${info?.currentVersion ?? currentAppVersion}`);
+        restoreHintLater(2200);
+        break;
+      case 'error':
+        updateBusy = false;
+        setUpdateHint('更新失败');
+        restoreHintLater(4000);
+        break;
+      default:
+        break;
+    }
+    if (message) console.info(`[update] ${stage}: ${message}`);
   });
 
   await listen<CatSkinConfig[]>('kuro-cats', (ev) => {

@@ -75,7 +75,11 @@ fn resolve_many_windows(processes: Vec<String>) -> Vec<AppMeta> {
             }
         }
         let meta = resolve_one(&raw, &running);
-        cache().lock().unwrap().insert(key, meta.clone());
+        // 「什么都没解析到」的结果不进缓存：软件可能是刚装的，下一次查询
+        // 就该拿到图标和路径了。缓存住 miss 反而把「后装软件」冻在占位符上。
+        if meta.exe_path.is_some() {
+            cache().lock().unwrap().insert(key, meta.clone());
+        }
         out.push(meta);
     }
     out
@@ -358,9 +362,13 @@ fn exe_version_info(path: &str) -> VersionInfo {
             if rc == 0 || value_ptr.is_null() || value_len == 0 {
                 return None;
             }
-            let units = value_len as usize / 2;
-            let text =
-                String::from_utf16_lossy(std::slice::from_raw_parts(value_ptr as *const u16, units));
+            // VerQueryValueW 对字符串值返回的长度是「WCHAR 个数（含结尾 null）」，
+            // 不是字节数——按字节数 /2 会把显示名砍掉一半（「Microsoft Edge」→「Microso」）。
+            // 这里直接按第一个 null 截断，语义与 wide_buf_to_string 一致。
+            let chars =
+                std::slice::from_raw_parts(value_ptr as *const u16, value_len as usize);
+            let end = chars.iter().position(|c| *c == 0).unwrap_or(chars.len());
+            let text = String::from_utf16_lossy(&chars[..end]);
             let text = text.trim().to_string();
             if text.is_empty() {
                 None

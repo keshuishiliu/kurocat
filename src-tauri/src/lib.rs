@@ -10,6 +10,7 @@ mod mcp;
 mod obs;
 mod privacy;
 mod recorder;
+mod sync;
 mod trail;
 mod tray;
 mod updater;
@@ -23,10 +24,12 @@ const WIN7_OFFSCREEN_PARK_POS: i32 = -16000;
 
 use cats::{all_cats, cat_exists, cats_path, sanitize_cat_id, CatSkinConfig};
 use config::{
-    config_path, load_settings, normalize_app_categories, normalize_categories,
-    normalize_input_log_active_gap, normalize_input_log_retention,
-    normalize_keyboard_layout, normalize_keyboard_orientation, normalize_tail_key_ids,
-    normalize_tail_key_mode, save_settings, set_windows_autostart, AppSettings, CategoryDef,
+    config_path, load_settings, normalize_app_categories, normalize_app_display_names,
+    normalize_app_ignored, normalize_categories, normalize_input_log_active_gap,
+    normalize_input_log_retention,
+    normalize_keyboard_layout, normalize_keyboard_orientation, normalize_sync_settings,
+    normalize_tail_key_ids, normalize_tail_key_mode, save_settings, set_windows_autostart,
+    AppSettings, CategoryDef, SyncSettings,
 };
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -356,9 +359,14 @@ fn update_settings(app: AppHandle, state: State<'_, AppState>, mut patch: AppSet
         // 通常是旧值（甚至空的），无条件覆盖会让用户刚排好的分类凭空消失。
         patch.categories = s.categories.clone();
         patch.app_categories = s.app_categories.clone();
+        // 应用标注同理：自定义名与忽略名单由 app_overrides_save 独占写入口。
+        patch.app_display_names = s.app_display_names.clone();
+        patch.app_ignored = s.app_ignored.clone();
         // 轨迹开关同理由 input_log_set_trail 独占：宠物窗口不会改它，
         // 但它手里那份设置可能是几小时前的快照，覆盖回去等于偷偷关掉采样。
         patch.input_log_trail_recording = s.input_log_trail_recording;
+        // 数据同步配置由统计窗口的 sync_configure 独占，理由同上。
+        patch.sync = s.sync.clone();
         *s = patch.clone();
         save_settings(&s);
     }
@@ -517,6 +525,145 @@ fn input_log_summary(
     recorder::summary(&from, &to, dim)
 }
 
+/// 单个应用的统计（键鼠汇总、按日趋势、前台热力图、top 按键）。
+#[tauri::command]
+fn input_log_app_stats(
+    process: String,
+    from: String,
+    to: String,
+) -> Result<recorder::AppStats, String> {
+    recorder::app_stats(&process, &from, &to)
+}
+
+// ---- 应用标注：自定义显示名 / 忽略开关 ----
+//
+// 与分类命令同一安全等级：能读出「你用过哪些程序、你给它们起了什么名、
+// 你不想统计谁」，**永远不许进 MCP 工具表**。
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppOverridesSnapshot {
+    app_display_names: std::collections::BTreeMap<String, String>,
+    app_ignored: std::collections::BTreeMap<String, bool>,
+}
+
+#[tauri::command]
+fn app_overrides_get(state: State<'_, AppState>) -> AppOverridesSnapshot {
+    let s = state.settings.lock().unwrap();
+    AppOverridesSnapshot {
+        app_display_names: s.app_display_names.clone(),
+        app_ignored: s.app_ignored.clone(),
+    }
+}
+
+/// 按「单个程序」打补丁而不是整份覆盖：改名与忽略都是单点操作，
+/// 两个统计窗口（或窗口与弹窗）并发时不会互相把对方的标注清掉。
+/// `display_name` 传空串表示清除自定义名；`ignored` 只在传了值时才改。
+#[tauri::command]
+fn app_overrides_save(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    process: String,
+    display_name: Option<String>,
+    ignored: Option<bool>,
+) -> Result<AppOverridesSnapshot, String> {
+    let process: String = process.trim().chars().take(120).collect();
+    if process.is_empty() {
+        return Err("进程名不能为空".to_string());
+    }
+    let ignored_changed;
+    {
+        let mut s = state.settings.lock().unwrap();
+        if let Some(name) = display_name {
+            let clean: String = name.trim().chars().take(40).collect();
+            if clean.is_empty() {
+                s.app_display_names.remove(&process);
+            } else {
+                s.app_display_names.insert(process.clone(), clean);
+            }
+        }
+        ignored_changed = ignored.is_some();
+        if let Some(on) = ignored {
+            if on {
+                s.app_ignored.insert(process.clone(), true);
+            } else {
+                s.app_ignored.remove(&process);
+            }
+        }
+        s.app_display_names = normalize_app_display_names(&s.app_display_names);
+        s.app_ignored = normalize_app_ignored(&s.app_ignored);
+        save_settings(&s);
+    }
+    // 忽略名单变了才打扰 recorder 线程；改名不影响记录行为
+    if ignored_changed {
+        let list: Vec<String> = state
+            .settings
+            .lock()
+            .unwrap()
+            .app_ignored
+            .keys()
+            .cloned()
+            .collect();
+        recorder::set_ignored_apps(&list);
+    }
+    let snapshot = {
+        let s = state.settings.lock().unwrap();
+        AppOverridesSnapshot {
+            app_display_names: s.app_display_names.clone(),
+            app_ignored: s.app_ignored.clone(),
+        }
+    };
+    let _ = app.emit("kuro-settings", state.settings.lock().unwrap().clone());
+    Ok(snapshot)
+}
+
+// ---- 数据同步（统计窗口专用；与输入记录命令一样，永远不进 MCP 工具表） ----
+//
+// 同步能导出全部输入统计（行为画像），安全等级与 input_log_* 一致。
+
+/// 保存同步设置。宠物窗口的 update_settings 会强制保留这份配置，
+/// 这里是唯一合法的写入口。
+#[tauri::command]
+fn sync_configure(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    sync: SyncSettings,
+) -> Result<SyncSettings, String> {
+    let clean = normalize_sync_settings(sync);
+    {
+        let mut s = state.settings.lock().unwrap();
+        s.sync = clean.clone();
+        save_settings(&s);
+    }
+    sync::apply_settings(clean.clone());
+    let snapshot = state.settings.lock().unwrap().clone();
+    let _ = app.emit("kuro-settings", snapshot);
+    Ok(clean)
+}
+
+#[tauri::command]
+fn sync_get_status() -> sync::SyncStatus {
+    sync::status()
+}
+
+/// WebDAV 连通性测试。网络操作放阻塞线程池，别卡主线程。
+#[tauri::command]
+async fn sync_test_connection(sync: SyncSettings) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        sync::test_connection(&normalize_sync_settings(sync))
+    })
+    .await
+    .map_err(|e| format!("任务失败: {e}"))?
+}
+
+/// 手动立即同步一次。
+#[tauri::command]
+async fn sync_now() -> Result<sync::SyncOutcome, String> {
+    tauri::async_runtime::spawn_blocking(sync::sync_now)
+        .await
+        .map_err(|e| format!("任务失败: {e}"))?
+}
+
 /// 批量解析应用元信息（exe 路径、显示名、版本、图标）。
 /// 图标要读 exe 资源，几十个程序可能耗一两秒，必须丢进阻塞线程池，不能堵 UI 线程。
 #[tauri::command]
@@ -601,7 +748,11 @@ fn input_log_apply_retention(
 fn input_log_clear() -> Result<(), String> {
     // 先收掉轨迹连接的句柄，否则 Windows 上 input-log 目录删不掉
     trail::wipe();
-    recorder::wipe_all()
+    recorder::wipe_all()?;
+    // 通知同步线程作废运行中的任务：meta.db 连同水位线一起没了，
+    // 下次同步会从全新状态全量导出，对端的差值合并会保证不重复入账。
+    sync::on_log_wiped();
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -2406,9 +2557,18 @@ pub fn run() {
                 s.input_log_enabled && !s.input_log_paused,
                 s.input_log_active_gap_minutes,
             );
+            // 用户忽略名单：启动时灌给 recorder，之后的增改由 app_overrides_save 推送
+            let ignored: Vec<String> = s.app_ignored.keys().cloned().collect();
+            recorder::set_ignored_apps(&ignored);
             // 轨迹采样：三件事同时成立才开始落盘（总开关、未暂停、轨迹开关）
             trail::init(
                 s.input_log_enabled && !s.input_log_paused && s.input_log_trail_recording,
+            );
+            // 数据同步：worker 全程存活，启动同步只在实际启用时发生
+            sync::init(
+                handle.clone(),
+                handle.state::<AppState>().settings.clone(),
+                s.sync.clone(),
             );
             if s.input_log_enabled && s.input_log_retention_days > 0 {
                 let retention_handle = handle.clone();
@@ -2546,15 +2706,24 @@ pub fn run() {
             input_log_trail_points,
             categories_get,
             categories_save,
+            input_log_app_stats,
+            app_overrides_get,
+            app_overrides_save,
+            sync_configure,
+            sync_get_status,
+            sync_test_connection,
+            sync_now,
             open_stats_window,
         ])
         .build(tauri::generate_context!())
         .expect("error while building KuroCat")
         .run(|_app, event| {
-            // 正常退出：把缓冲里未提交的记录刷盘，做到「正常退出丢 0 条」
+            // 正常退出：把缓冲里未提交的记录刷盘，做到「正常退出丢 0 条」；
+            // 同步随后尝试最后一次上传（最多等 12 秒，失败不阻塞退出）。
             if let tauri::RunEvent::Exit = event {
                 recorder::shutdown();
                 trail::shutdown();
+                sync::shutdown_sync();
             }
         });
 }

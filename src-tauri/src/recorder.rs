@@ -29,7 +29,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const KIND_KEY_DOWN: i32 = 0;
@@ -56,7 +56,7 @@ const FOCUS_SAMPLE_MS: i64 = 2_000;
 /// 这段直接丢弃——否则合盖一晚会把 8 小时算给当时的前台程序。
 const FOCUS_STALE_MS: i64 = 60_000;
 
-const META_SCHEMA: &str = r#"
+pub(crate) const META_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS apps (
     id      INTEGER PRIMARY KEY,
     process TEXT NOT NULL UNIQUE
@@ -100,6 +100,33 @@ CREATE TABLE IF NOT EXISTS daily_app_focus (
     seconds INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (day, hour, app_id)
 ) WITHOUT ROWID;
+
+-- ---------------------------------------------------------------------------
+-- 数据同步（sync.rs 专用）。键值对放一张通用表：machine_id、导出/导入水位线、
+-- 上次同步时间与结果都往里塞，以后加状态不用改表结构。
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS sync_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+-- 已成功导入过的「来源机器 × 合并包名」。同名包绝不二次导入，这是防重复计数的
+-- 第一道闸（第二道是导入侧的差值合并，见 merge_state）。
+CREATE TABLE IF NOT EXISTS imported_packs (
+    source_id   TEXT    NOT NULL,
+    pack_name   TEXT    NOT NULL,
+    imported_at INTEGER NOT NULL,
+    PRIMARY KEY (source_id, pack_name)
+) WITHOUT ROWID;
+-- 每个来源机器、每个统计键上次导入时的取值。导入时只应用「本次值 − 上次值」的
+-- 差值，所以同一个包重复导入、甚至登记表整个丢失，计数也不会翻倍。
+-- gkey 里的应用维度用进程名而不是对方库的 app_id：对方清空重建后 id 会变，
+-- 进程名才是跨机器稳定的身份。
+CREATE TABLE IF NOT EXISTS merge_state (
+    source_id TEXT    NOT NULL,
+    gkey      TEXT    NOT NULL,
+    last_n    INTEGER NOT NULL,
+    PRIMARY KEY (source_id, gkey)
+) WITHOUT ROWID;
 "#;
 
 // ---------------------------------------------------------------------------
@@ -130,6 +157,8 @@ enum Msg {
     },
     /// 调整活跃判定阈值（分钟）。
     SetGap(u32),
+    /// 用户忽略名单变了：清前台缓存，让新名单立刻生效（最多延迟一次采样周期）。
+    IgnoredChanged,
 }
 
 static TX: OnceLock<Sender<Msg>> = OnceLock::new();
@@ -137,6 +166,43 @@ static RECORDING: AtomicBool = AtomicBool::new(false);
 static STARTED: AtomicBool = AtomicBool::new(false);
 /// 活跃判定阈值的毫秒值。线程启动前就要能读到，所以单独放一个原子量。
 static GAP_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(300_000);
+/// 用户显式忽略的程序（去 .exe 的小写主干）。独立于写线程的消息通道：
+/// ingest 每 200 ms 才解析一次前台进程，直接读这个集合比来回发消息查询便宜，
+/// 修改时再发 IgnoredChanged 清缓存，两边加起来延迟不超过一次采样周期。
+static USER_IGNORED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+
+fn user_ignored_set() -> &'static Mutex<std::collections::HashSet<String>> {
+    USER_IGNORED.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// "Chrome.EXE" / "chrome.exe" → "chrome"。忽略匹配只看主干，
+/// 大小写与扩展名差异不构成漏网之鱼。
+fn normalize_ignored_key(app: &str) -> String {
+    let lower = app.trim().to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+    stem.chars().take(120).collect()
+}
+
+fn is_user_ignored(name: &str) -> bool {
+    let key = normalize_ignored_key(name);
+    if key.is_empty() {
+        return false;
+    }
+    user_ignored_set()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&key)
+}
+
+/// 更新用户忽略名单并通知记录线程。名单为空是合法状态（全部取消忽略）。
+pub fn set_ignored_apps(apps: &[String]) {
+    let set: std::collections::HashSet<String> =
+        apps.iter().map(|a| normalize_ignored_key(a)).collect();
+    *user_ignored_set().lock().unwrap_or_else(|e| e.into_inner()) = set;
+    if let Some(tx) = TX.get() {
+        let _ = tx.send(Msg::IgnoredChanged);
+    }
+}
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -262,7 +328,7 @@ pub fn shutdown() {
 ///
 /// 换算放在 Rust 侧而不是 SQL 的 `'localtime'` 修饰符：后者依赖运行环境时区、
 /// 受 `TZ` 影响，不同机器会给出不同结果。
-fn day_hour_local(ts_ms: i64) -> (String, u32) {
+pub(crate) fn day_hour_local(ts_ms: i64) -> (String, u32) {
     match Local.timestamp_millis_opt(ts_ms).single() {
         Some(dt) => (
             format!("{:04}-{:02}-{:02}", dt.year(), dt.month(), dt.day()),
@@ -272,9 +338,15 @@ fn day_hour_local(ts_ms: i64) -> (String, u32) {
     }
 }
 
-fn month_of(ts_ms: i64) -> String {
+/// 事件月表用的月份：6 位纯数字 "202611"。只服务 events 月表命名与保留期比较。
+///
+/// 注意：meta.db 的 `monthly_app_keys.month` 存的是带横杠的 "2026-11"（见
+/// record() 里的 `day[..7]`，前端也按该格式查询），两套格式并存是有意的，
+/// 别互相「统一」——2026-11-25 之前 `month_of` 曾错误地返回 "2026-11"，
+/// 被 `is_valid_month` 拒绝导致事件明细从未落盘（见 write_events）。
+pub(crate) fn month_of(ts_ms: i64) -> String {
     let (day, _) = day_hour_local(ts_ms);
-    day[..7].to_string()
+    format!("{}{}", &day[..4], &day[5..7])
 }
 
 /// 只接受 6 位纯数字的月份，任何其它输入一律拒绝——这是拼表名前的白名单校验。
@@ -282,7 +354,7 @@ fn is_valid_month(m: &str) -> bool {
     m.len() == 6 && m.bytes().all(|b| b.is_ascii_digit())
 }
 
-fn month_table_name(month: &str) -> String {
+pub(crate) fn month_table_name(month: &str) -> String {
     format!("events_{month}")
 }
 
@@ -321,7 +393,9 @@ struct Recorder {
     buf: Vec<BufRow>,
     pending: Accum,
     last_ts_by_app: HashMap<i64, i64>,
-    app_cache: Option<(i64, i64)>,
+    /// (缓存时刻, (进程名, app_id))。进程名随缓存一起留一份，ingest 要拿它对
+    /// 忽略名单做判断；None 表示那一刻解析不出前台程序。
+    app_cache: Option<(i64, Option<(String, i64)>)>,
     privacy_ranges: Vec<(i64, i64)>,
     privacy_open: bool,
     gap_ms: i64,
@@ -409,6 +483,12 @@ impl Recorder {
                 Ok(Msg::SetGap(minutes)) => {
                     self.gap_ms = minutes.clamp(1, 120) as i64 * 60_000;
                 }
+                Ok(Msg::IgnoredChanged) => {
+                    // 名单刚变：丢弃进程缓存，避免被忽略的程序在缓存窗口内继续入账；
+                    // 前台游标归零，忽略目标已占据的那两秒不再继续结算给它。
+                    self.app_cache = None;
+                    self.focus_last_app = -1;
+                }
                 Ok(Msg::Wipe { reply }) => {
                     let result = self.wipe();
                     let _ = reply.send(result);
@@ -464,7 +544,15 @@ impl Recorder {
     }
 
     fn ingest(&mut self, r: RawRecord) {
-        let app_id = self.resolve_app_id(r.ts);
+        let fg = self.resolve_fg(r.ts);
+        // 用户忽略的程序：事件、活跃时长一个字节都不记。名单是全局量，
+        // 读一次锁的成本被 200 ms 的进程缓存摊薄。
+        if let Some((name, _)) = &fg {
+            if is_user_ignored(name) {
+                return;
+            }
+        }
+        let app_id = fg.map(|(_, id)| id).unwrap_or(-1);
         self.account_active(r.ts, app_id);
 
         let (day, hour) = day_hour_local(r.ts);
@@ -530,18 +618,23 @@ impl Recorder {
         self.last_ts_by_app.insert(app_id, ts);
     }
 
-    fn resolve_app_id(&mut self, now: i64) -> i64 {
-        if let Some((cached_at, id)) = self.app_cache {
+    /// 前台进程解析（带 200 ms 缓存）。返回 (进程名, app_id)；
+    /// 解析不出前台程序时返回 None，调用方按 app_id = -1 记账。
+    fn resolve_fg(&mut self, now: i64) -> Option<(String, i64)> {
+        if let Some((cached_at, hit)) = &self.app_cache {
             if now - cached_at <= APP_CACHE_MS {
-                return id;
+                return hit.clone();
             }
         }
-        let id = match foreground_process() {
-            Some(name) => self.upsert_app(&name).unwrap_or(-1),
-            None => -1,
+        let hit = match foreground_process() {
+            Some(name) => {
+                let id = self.upsert_app(&name).unwrap_or(-1);
+                Some((name, id))
+            }
+            None => None,
         };
-        self.app_cache = Some((now, id));
-        id
+        self.app_cache = Some((now, hit.clone()));
+        hit
     }
 
     // -- 前台计时 ----------------------------------------------------------
@@ -621,7 +714,7 @@ impl Recorder {
         let Some(name) = foreground_process() else {
             return -1;
         };
-        if is_ignored_focus_process(&name) {
+        if is_ignored_focus_process(&name) || is_user_ignored(&name) {
             return -1;
         }
         // 复用 upsert_app：进程名原样入库，与按键记录共用同一张 apps 表，
@@ -889,7 +982,9 @@ impl Recorder {
         self.meta
             .execute(
                 "DELETE FROM monthly_app_keys WHERE month < ?1",
-                params![cutoff_month],
+                // monthly_app_keys.month 是 "YYYY-MM" 格式，与事件表名的 6 位数字
+                // 是两套格式；cutoff_month（month_of）不能拿来跟它比。
+                params![&cutoff_day[..7]],
             )
             .map_err(|e| e.to_string())?;
 
@@ -901,7 +996,7 @@ impl Recorder {
     }
 }
 
-fn ensure_month_table(conn: &Connection, month: &str) -> rusqlite::Result<()> {
+pub(crate) fn ensure_month_table(conn: &Connection, month: &str) -> rusqlite::Result<()> {
     let table = month_table_name(month);
     conn.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS {table} (
@@ -917,7 +1012,7 @@ fn ensure_month_table(conn: &Connection, month: &str) -> rusqlite::Result<()> {
     ))
 }
 
-fn list_event_months(conn: &Connection) -> Result<Vec<String>, String> {
+pub(crate) fn list_event_months(conn: &Connection) -> Result<Vec<String>, String> {
     let mut stmt = conn
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'events\\_%' ESCAPE '\\'")
         .map_err(|e| e.to_string())?;
@@ -1426,6 +1521,232 @@ pub fn app_last_seen(from_day: &str, to_day: &str) -> Result<Vec<AppActivity>, S
     Ok(rows.flatten().collect())
 }
 
+// ---------------------------------------------------------------------------
+// 应用详情统计（统计窗口的应用弹窗专用）
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppStatsDaily {
+    pub day: String,
+    pub keydown: i64,
+    pub mousedown: i64,
+    pub active_seconds: i64,
+    pub focus_seconds: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppStatsHeatCell {
+    pub day: String,
+    pub hour: i32,
+    pub seconds: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppStatsKey {
+    pub label: String,
+    pub n: i64,
+}
+
+/// 单个程序的统计快照。found = false 表示库里从没见过这个进程名（参数传错或
+/// 记录期间进程名改了），前端据此显示空态而不是一排 0。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppStats {
+    pub process: String,
+    pub found: bool,
+    pub keydown: i64,
+    pub mousedown: i64,
+    pub active_seconds: i64,
+    pub focus_seconds: i64,
+    pub first_day: Option<String>,
+    pub last_day: Option<String>,
+    /// 按日趋势：区间内每天都有键鼠或前台数据的日期。
+    pub daily: Vec<AppStatsDaily>,
+    /// 热力图：day × hour 的前台秒数（daily_app_focus，口径为「窗口在前面挂多久」）。
+    pub heatmap: Vec<AppStatsHeatCell>,
+    /// 该程序最常按的键（monthly_app_keys 按月聚合，上限 10）。
+    pub top_keys: Vec<AppStatsKey>,
+}
+
+/// 查询单个应用的统计。参数是枚举化的日期字符串，与 summary 一致，
+/// 不接受任何 SQL 片段。
+pub fn app_stats(process: &str, from_day: &str, to_day: &str) -> Result<AppStats, String> {
+    let conn = open_meta_readonly()?;
+    let mut out = AppStats {
+        process: process.to_string(),
+        found: false,
+        keydown: 0,
+        mousedown: 0,
+        active_seconds: 0,
+        focus_seconds: 0,
+        first_day: None,
+        last_day: None,
+        daily: Vec::new(),
+        heatmap: Vec::new(),
+        top_keys: Vec::new(),
+    };
+
+    // 先精确匹配（apps.process 是 UNIQUE），再大小写不敏感兜底：
+    // Windows 的进程名大小写不稳定，前端传来的 label 与入库值偶有差异。
+    let app_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM apps WHERE process = ?1",
+            params![process],
+            |r| r.get(0),
+        )
+        .ok()
+        .or_else(|| {
+            conn.query_row(
+                "SELECT id FROM apps WHERE lower(process) = lower(?1)",
+                params![process],
+                |r| r.get(0),
+            )
+            .ok()
+        });
+    let Some(app_id) = app_id else {
+        return Ok(out);
+    };
+    out.found = true;
+
+    let (kd, md, act) = conn
+        .query_row(
+            "SELECT \
+               COALESCE(SUM(CASE WHEN kind = 0 THEN n END), 0), \
+               COALESCE(SUM(CASE WHEN kind = 1 THEN n END), 0), \
+               COALESCE(SUM(CASE WHEN kind = 0 THEN active_seconds END), 0) \
+             FROM daily_apps WHERE app_id = ?1 AND day >= ?2 AND day <= ?3",
+            params![app_id, from_day, to_day],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
+        )
+        .map_err(|e| e.to_string())?;
+    out.keydown = kd;
+    out.mousedown = md;
+    out.active_seconds = act;
+
+    out.focus_seconds = conn
+        .query_row(
+            "SELECT COALESCE(SUM(seconds), 0) FROM daily_app_focus \
+             WHERE app_id = ?1 AND day >= ?2 AND day <= ?3",
+            params![app_id, from_day, to_day],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+
+    if let Ok((first, last)) = conn.query_row(
+        "SELECT MIN(day), MAX(day) FROM ( \
+            SELECT day FROM daily_apps WHERE app_id = ?1 AND day >= ?2 AND day <= ?3 \
+            UNION SELECT day FROM daily_app_focus WHERE app_id = ?1 AND day >= ?2 AND day <= ?3 \
+         )",
+        params![app_id, from_day, to_day],
+        |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+    ) {
+        out.first_day = first;
+        out.last_day = last;
+    }
+
+    // 按日趋势：键鼠来自 daily_apps（按天分组），前台来自 daily_app_focus，
+    // 两张独立表在代码里按天合并，join 会互相放大行数。
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT day, \
+                   COALESCE(SUM(CASE WHEN kind = 0 THEN n END), 0), \
+                   COALESCE(SUM(CASE WHEN kind = 1 THEN n END), 0), \
+                   COALESCE(SUM(CASE WHEN kind = 0 THEN active_seconds END), 0) \
+                 FROM daily_apps WHERE app_id = ?1 AND day >= ?2 AND day <= ?3 \
+                 GROUP BY day ORDER BY day",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![app_id, from_day, to_day], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut daily: Vec<AppStatsDaily> = rows
+            .flatten()
+            .map(|(day, kd, md, act)| AppStatsDaily {
+                day,
+                keydown: kd,
+                mousedown: md,
+                active_seconds: act,
+                focus_seconds: 0,
+            })
+            .collect();
+
+        let mut focus_stmt = conn
+            .prepare(
+                "SELECT day, SUM(seconds) FROM daily_app_focus \
+                 WHERE app_id = ?1 AND day >= ?2 AND day <= ?3 GROUP BY day",
+            )
+            .map_err(|e| e.to_string())?;
+        let focus_rows = focus_stmt
+            .query_map(params![app_id, from_day, to_day], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        let focus_map: HashMap<String, i64> = focus_rows.flatten().collect();
+        for row in daily.iter_mut() {
+            if let Some(v) = focus_map.get(&row.day) {
+                row.focus_seconds = *v;
+            }
+        }
+        out.daily = daily;
+    }
+
+    // 热力图：daily_app_focus 天然带 day + hour 维度，直接整表捞出该程序区间内的行。
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT day, hour, seconds FROM daily_app_focus \
+                 WHERE app_id = ?1 AND day >= ?2 AND day <= ?3 ORDER BY day, hour",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![app_id, from_day, to_day], |r| {
+                Ok(AppStatsHeatCell {
+                    day: r.get(0)?,
+                    hour: r.get(1)?,
+                    seconds: r.get(2)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        out.heatmap = rows.flatten().collect();
+    }
+
+    // top 按键：monthly_app_keys 的 month 是 "YYYY-MM"（见 META_SCHEMA 注释），
+    // 边界用日期字符串截前 7 位，与保留期清理的口径一致。
+    {
+        let from_month = &from_day[..7.min(from_day.len())];
+        let to_month = &to_day[..7.min(to_day.len())];
+        let mut stmt = conn
+            .prepare(
+                "SELECT code, SUM(n) FROM monthly_app_keys \
+                 WHERE app_id = ?1 AND month >= ?2 AND month <= ?3 \
+                 GROUP BY code ORDER BY 2 DESC LIMIT 10",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![app_id, from_month, to_month], |r| {
+                Ok(AppStatsKey {
+                    label: vk_label(r.get::<_, i64>(0)?),
+                    n: r.get(1)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        out.top_keys = rows.flatten().collect();
+    }
+
+    Ok(out)
+}
+
 pub fn vk_label(code: i64) -> String {
     match code {
         0x08 => "Backspace".into(),
@@ -1675,6 +1996,22 @@ mod tests {
         assert!(!is_valid_month("../etc"));
     }
 
+    /// 回归：month_of 必须产出 6 位纯数字（合法表名成分）。
+    /// 2026-11-25 之前它返回 "2026-11"，被 is_valid_month 拒绝，
+    /// 导致事件明细从未写入 events.db（写路径静默 continue）。
+    #[test]
+    fn month_of_is_table_safe() {
+        // 2023-11-14 22:13:20 UTC → 本地时区的月份
+        let m = month_of(1_700_000_000_000);
+        assert!(is_valid_month(&m), "month_of({m}) 必须通过表名白名单");
+        assert_eq!(m.len(), 6);
+        assert!(!m.contains('-'));
+
+        // 月中时间点，任何时区（UTC±14 以内）都落在同一个月
+        let mid = month_of(1_750_000_000_000); // 2025-06-15 15:06 UTC
+        assert_eq!(mid, "202506");
+    }
+
     #[test]
     fn vk_labels_cover_required_keys() {
         assert_eq!(vk_label(0x1B), "Esc");
@@ -1711,6 +2048,14 @@ mod tests {
         let mut acc = Accum::default();
         acc.daily_hours.insert(("2026-11-24".into(), 10), [3, 2]);
         assert_eq!(acc.daily_hours[&("2026-11-24".to_string(), 10)], [3, 2]);
+    }
+
+    #[test]
+    fn user_ignore_key_normalizes_case_and_suffix() {
+        assert_eq!(normalize_ignored_key("Chrome.EXE"), "chrome");
+        assert_eq!(normalize_ignored_key("  Notepad.exe "), "notepad");
+        assert_eq!(normalize_ignored_key("Code"), "code");
+        assert_eq!(normalize_ignored_key(""), "");
     }
 
     #[test]
