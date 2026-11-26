@@ -13,6 +13,11 @@ export interface TrailPoint {
   t: number;
   x: number;
   y: number;
+  /**
+   * 采样时前台应用所属的分类 id（v5.2.1 起才有，老数据为 null）。
+   * null = 未归类 / 锁屏 / 隐私窗口期间采的点，回放时显示灰色。
+   */
+  cat?: string | null;
 }
 
 export interface TrailTick {
@@ -76,6 +81,12 @@ export class TrailPlayer {
   private palette: Palette = currentPalette();
   private bounds = { minX: 0, maxX: 1, minY: 0, maxY: 1 };
   private resizeObserver: ResizeObserver | null = null;
+  /**
+   * 分类 → 颜色。参数是采样点的 cat 字段（可能为 null/undefined）。
+   * statsMain 注入；不注入时维持原来的单色 accent 行为。
+   * 每次绘制时才调用，分类改名/换色立即生效，不需要重载数据。
+   */
+  private colorFor: ((cat: string | null | undefined) => string) | null = null;
 
   constructor(
     canvas: HTMLCanvasElement,
@@ -97,6 +108,12 @@ export class TrailPlayer {
 
   get pointCount(): number {
     return this.points.length;
+  }
+
+  /** 注入分类着色函数。传入 null 恢复单色。 */
+  setCategoryColors(fn: ((cat: string | null | undefined) => string) | null): void {
+    this.colorFor = fn;
+    if (!this.playing) this.draw();
   }
 
   get isPlaying(): boolean {
@@ -275,6 +292,54 @@ export class TrailPlayer {
     }
   }
 
+  /** 两个采样点是否属于同一分类（null 视为同一类，段间不因它断开）。 */
+  private sameCat(a: number, b: number): boolean {
+    return (this.points[a].cat ?? null) === (this.points[b].cat ?? null);
+  }
+
+  /**
+   * 分类着色的描线：按 cat 变化 / breaks 把 [from..to] 切成小段，
+   * 每段用段首点的分类颜色单独 stroke。未注入 colorFor 时退化为单色。
+   */
+  private strokeColoredPath(
+    from: number,
+    to: number,
+    proj: { x: (v: number) => number; y: (v: number) => number },
+    alpha: number,
+    width: number,
+  ): void {
+    const ctx = this.ctx;
+    if (!this.colorFor) {
+      ctx.beginPath();
+      this.tracePath(from, to, proj);
+      ctx.globalAlpha = alpha;
+      ctx.lineWidth = width;
+      ctx.strokeStyle = this.palette.accent;
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      return;
+    }
+    ctx.lineJoin = 'round';
+    let segStart = from;
+    const flush = (a: number, b: number): void => {
+      if (b <= a) return;
+      ctx.beginPath();
+      this.tracePath(a, b, proj);
+      ctx.globalAlpha = alpha;
+      ctx.lineWidth = width;
+      ctx.strokeStyle = this.colorFor!(this.points[a].cat);
+      ctx.stroke();
+    };
+    for (let i = from + 1; i <= to; i++) {
+      if (this.breaks[i] || !this.sameCat(i - 1, i)) {
+        flush(segStart, i - 1);
+        segStart = i;
+      }
+    }
+    flush(segStart, to);
+    ctx.globalAlpha = 1;
+  }
+
   private draw(): void {
     const canvas = this.canvas;
     const dpr = window.devicePixelRatio || 1;
@@ -324,19 +389,15 @@ export class TrailPlayer {
       ctx.stroke();
     }
 
-    // 2) 已播放部分
+    // 2) 已播放部分（分类着色：每段用该段采样时前台应用的分类色）
     const head = this.indexAt(this.cursorMs);
     if (head > 0) {
-      ctx.strokeStyle = this.palette.accent;
       ctx.globalAlpha = 0.45;
-      ctx.lineWidth = 1.2;
-      ctx.lineJoin = 'round';
-      this.tracePath(0, head, proj);
-      ctx.stroke();
+      this.strokeColoredPath(0, head, proj, 0.45, 1.2);
       ctx.globalAlpha = 1;
     }
 
-    // 3) 尾迹：分段递增透明度，比逐段渐变便宜得多
+    // 3) 尾迹：分段递增透明度，比逐段渐变便宜得多；颜色跟随块首的分类
     const tailStart = Math.max(1, head - TAIL_SEGMENTS);
     const chunks = 16;
     const per = Math.max(1, Math.ceil((head - tailStart) / chunks));
@@ -345,7 +406,9 @@ export class TrailPlayer {
       const to = Math.min(head, from + per);
       if (to <= from) break;
       const alpha = 0.06 + (0.9 * (c + 1)) / chunks;
-      ctx.strokeStyle = this.palette.accent;
+      ctx.strokeStyle = this.colorFor
+        ? this.colorFor(this.points[Math.max(0, from - 1)].cat)
+        : this.palette.accent;
       ctx.globalAlpha = alpha;
       ctx.lineWidth = 1.4 + (1.4 * (c + 1)) / chunks;
       ctx.lineCap = 'round';

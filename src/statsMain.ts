@@ -220,7 +220,7 @@ const DEMO_APP_META: Record<string, { name: string; version: string; path: strin
   },
   'kurocat.exe': {
     name: 'Kuro 猫猫宠',
-    version: '5.2.0',
+    version: '5.3.0',
     path: 'D:\\Programs\\kurocat\\KuroCat.exe',
   },
   'windowsterminal.exe': {
@@ -1405,7 +1405,37 @@ function ensureTrailPlayer(): TrailPlayer {
     const playBtn = $('trail-play') as HTMLButtonElement;
     playBtn.textContent = info.playing ? '暂停' : info.progress >= 1 ? '重播' : '开始';
   });
+  // 分类着色：采样点的 cat → 分类色。每次绘制动态取最新分类设置，
+  // 改名/换色立即生效，不用重载数据；未归类/老数据用灰色。
+  trail.setCategoryColors((cat) => findCategory(cat)?.color ?? '#8b909c');
   return trail;
+}
+
+/** 轨迹页图例：只列出这次回放里真实出现过的分类。 */
+function renderTrailLegend(points: TrailPoint[]): void {
+  const el = document.getElementById('trail-legend');
+  if (!el) return;
+  const seen = new Set<string>();
+  let hasUncategorized = false;
+  for (const p of points) {
+    if (p.cat) seen.add(p.cat);
+    else hasUncategorized = true;
+  }
+  const items: string[] = [];
+  for (const id of seen) {
+    const c = findCategory(id);
+    if (!c) continue; // 分类已被删除：着色时同样落灰，图例里显示未归类即可
+    items.push(
+      `<span class="lg-item"><i class="lg-dot" style="background:${escapeHtml(c.color)}"></i>${escapeHtml(c.name)}</span>`,
+    );
+    hasUncategorized = false; // 有已删除分类的点也会画灰，一并算未归类
+  }
+  if (hasUncategorized) {
+    items.push(
+      '<span class="lg-item"><i class="lg-dot" style="background:#8b909c"></i>未归类</span>',
+    );
+  }
+  el.innerHTML = items.join('');
 }
 
 function updateTrailAvailability(): void {
@@ -1440,6 +1470,7 @@ async function loadTrail(): Promise<void> {
   const rows = points ?? [];
   trailPointTotal = rows.length;
   player.setPoints(rows);
+  renderTrailLegend(rows);
   trailLoaded = true;
   $('trail-sub').textContent = rows.length
     ? `${fmtNum(rows.length)} 个采样点 · ${timeStr(from)} ~ ${timeStr(to)}`
@@ -2099,6 +2130,8 @@ async function boot(): Promise<void> {
   subscribe(() => {
     renderCategoryList();
     renderAppCategoryList();
+    // 轨迹着色与图例也依赖分类设置：colorFor 是动态取的，重设一次触发重绘
+    trail?.setCategoryColors((cat) => findCategory(cat)?.color ?? '#8b909c');
     if (document.getElementById('page-stats')?.classList.contains('active')) void loadStats();
   });
   // 自定义名 / 忽略变了：列表立即重画（改名会变标题，忽略会影响统计口径）

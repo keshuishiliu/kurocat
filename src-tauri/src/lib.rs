@@ -789,6 +789,8 @@ fn categories_save(
         s.app_categories = mapped.clone();
         save_settings(&s);
     }
+    // 轨迹着色快照同步刷新：下一次前台采样（≤2s）就按新映射发布
+    crate::trail::set_category_map(mapped.clone().into_iter().collect());
     CategorySnapshot {
         categories: clean,
         app_categories: mapped,
@@ -1111,7 +1113,9 @@ async fn open_stats_window(app: AppHandle) -> Result<(), String> {
     .skip_taskbar(false)
     .center()
     // 必须与主窗口一致，否则 WebView2 在同一个 userDataFolder 下拒绝创建第二个窗口
-    .additional_browser_args("--autoplay-policy=no-user-gesture-required")
+    // （HRESULT 0x8007139F，同下方菜单窗口的注释）。v5.0 起主/菜单窗口统一用
+    // WEBVIEW_BROWSER_ARGS，统计窗口也必须同步，否则合并后统计窗口创建直接失败。
+    .additional_browser_args(WEBVIEW_BROWSER_ARGS)
     .build()
     .map_err(|e| format!("创建统计窗口失败: {e}"))?;
     let _ = created.set_focus();
@@ -3441,6 +3445,8 @@ pub fn run() {
             trail::init(
                 s.input_log_enabled && !s.input_log_paused && s.input_log_trail_recording,
             );
+            // 轨迹着色用的「进程 → 分类」映射：启动时灌一份，之后 categories_save 推送
+            trail::set_category_map(s.app_categories.clone().into_iter().collect());
             // 数据同步：worker 全程存活，启动同步只在实际启用时发生
             sync::init(
                 handle.clone(),

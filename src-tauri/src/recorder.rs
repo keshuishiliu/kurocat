@@ -666,6 +666,7 @@ impl Recorder {
             self.focus_last_ts = Some(now);
             self.focus_last_app = -1;
             self.focus_carry_ms = 0;
+            crate::trail::publish_focus_process(None);
             return;
         }
 
@@ -675,6 +676,7 @@ impl Recorder {
             self.focus_last_ts = Some(now);
             self.focus_last_app = -1;
             self.focus_carry_ms = 0;
+            crate::trail::publish_focus_process(None);
             return;
         }
 
@@ -688,6 +690,7 @@ impl Recorder {
             self.focus_last_ts = Some(now);
             self.focus_last_app = -1;
             self.focus_carry_ms = 0;
+            crate::trail::publish_focus_process(None);
             return;
         }
 
@@ -706,23 +709,37 @@ impl Recorder {
             }
         }
 
-        self.focus_last_app = self.focus_app_now(now);
+        let focus = self.focus_app_now(now);
+        match &focus {
+            Some((app_id, process)) => {
+                self.focus_last_app = *app_id;
+                // 轨迹着色快照：前台进程 → 分类。映射在 trail 模块内完成，
+                // 这里只发布进程名，不落盘。
+                crate::trail::publish_focus_process(Some(process));
+            }
+            None => {
+                self.focus_last_app = -1;
+                crate::trail::publish_focus_process(None);
+            }
+        }
         self.focus_last_ts = Some(now);
     }
 
     /// 采样专用的前台程序解析。**故意不复用 `resolve_app_id`**：那条路径会写
     /// `app_cache`，而锁屏界面被过滤成 -1 后如果写进缓存，紧接着的真实按键就会
     /// 跟着记成 NULL，200 ms 内都恢复不过来。
-    fn focus_app_now(&mut self, _now: i64) -> i64 {
-        let Some(name) = foreground_process() else {
-            return -1;
-        };
+    ///
+    /// 返回 `(app_id, 进程名)`；None = 锁屏界面 / 用户忽略 / 系统拿不到前台。
+    /// 进程名同时喂给 trail 的分类快照（见 sample_focus）。
+    fn focus_app_now(&mut self, _now: i64) -> Option<(i64, String)> {
+        let name = foreground_process()?;
         if is_ignored_focus_process(&name) || is_user_ignored(&name) {
-            return -1;
+            return None;
         }
         // 复用 upsert_app：进程名原样入库，与按键记录共用同一张 apps 表，
         // 这样应用库、分类映射看到的就是同一行，不会凭空多出一个「Chrome」。
-        self.upsert_app(&name).unwrap_or(-1)
+        let id = self.upsert_app(&name).unwrap_or(-1);
+        Some((id, name))
     }
 
     fn upsert_app(&self, process: &str) -> rusqlite::Result<i64> {

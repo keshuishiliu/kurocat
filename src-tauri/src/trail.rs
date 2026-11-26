@@ -8,7 +8,9 @@
 //!
 //! # 隐私边界
 //!
-//! - 只存 **时间戳 + 屏幕坐标**，不存画面、窗口标题、点击目标、任何内容。
+//! - 只存 **时间戳 + 屏幕坐标 + 分类 id**（可选）。不存画面、窗口标题、进程名、
+//!   任何内容。分类 id 是用户自己在设置里划分的组（如「工作」「游戏」），
+//!   用于回放时给轨迹上色；进程名本身绝不落盘，映射成分类在内存里完成。
 //! - **默认关闭**。没打开开关时一个字节都不落盘，`push()` 里第一行就返回。
 //! - 密码框激活期间不采样（由 `input_hook` 在调用点判断）。
 //! - 与 `recorder` 共用 `input-log` 目录，清空 / 保留期清理会一起处理。
@@ -20,11 +22,12 @@
 
 use rusqlite::{params, Connection, OpenFlags};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// 采样最短间隔：约 10 Hz。
@@ -43,11 +46,43 @@ static LAST_TS: AtomicI64 = AtomicI64::new(0);
 static LAST_X: AtomicI64 = AtomicI64::new(0);
 static LAST_Y: AtomicI64 = AtomicI64::new(0);
 
-#[derive(Clone, Copy)]
+/// 进程名 → 分类 id 映射（settings 的 `app_categories` 快照）。
+/// `lib.rs` 在启动和 `categories_save` 时整表替换，读取方只拿 Arc，无锁竞争热点。
+static CAT_BY_PROCESS: OnceLock<RwLock<Arc<HashMap<String, String>>>> = OnceLock::new();
+/// recorder 每 2 秒发布的「当前前台进程所属分类」。None = 锁屏 / 隐私 / 未归类，
+/// 轨迹点落 NULL，回放时显示灰色。
+static CURRENT_CAT: RwLock<Option<Arc<str>>> = RwLock::new(None);
+
+/// 更新进程名 → 分类映射。settings 保存 / 启动时调用。
+pub fn set_category_map(map: HashMap<String, String>) {
+    let cell = CAT_BY_PROCESS.get_or_init(|| RwLock::new(Arc::new(HashMap::new())));
+    if let Ok(mut guard) = cell.write() {
+        *guard = Arc::new(map);
+    }
+}
+
+/// recorder 前台采样器每轮调用：把「当前前台进程」映射成分类快照。
+/// `None` 或未归类都会清空快照——轨迹点落 NULL，隐私窗口/锁屏/未归类语义一致。
+pub fn publish_focus_process(process: Option<&str>) {
+    let cat = process.and_then(|name| {
+        CAT_BY_PROCESS
+            .get_or_init(|| RwLock::new(Arc::new(HashMap::new())))
+            .read()
+            .ok()
+            .and_then(|m| m.get(name).cloned())
+            .map(|c| -> Arc<str> { Arc::from(c.as_str()) })
+    });
+    if let Ok(mut guard) = CURRENT_CAT.write() {
+        *guard = cat;
+    }
+}
+
+#[derive(Clone)]
 struct Row {
     ts: i64,
     x: i32,
     y: i32,
+    cat: Option<Arc<str>>,
 }
 
 enum Msg {
@@ -93,8 +128,11 @@ pub fn push(x: i32, y: i32) {
     LAST_TS.store(ts, Ordering::Relaxed);
     LAST_X.store(x as i64, Ordering::Relaxed);
     LAST_Y.store(y as i64, Ordering::Relaxed);
+    // 前台分类快照：recorder 每 2 秒发布，这里只读。读锁短暂且写者极少
+    // （前台切换 / 分类保存），不会反压 hook dispatcher 线程。
+    let cat = CURRENT_CAT.read().ok().and_then(|c| c.clone());
     if let Some(tx) = TX.get() {
-        let _ = tx.send(Msg::Sample(Row { ts, x, y }));
+        let _ = tx.send(Msg::Sample(Row { ts, x, y, cat }));
     }
 }
 
@@ -260,11 +298,16 @@ impl TrailRecorder {
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         {
             let mut stmt = tx
-                .prepare("INSERT INTO trail(ts, x, y) VALUES(?1, ?2, ?3)")
+                .prepare("INSERT INTO trail(ts, x, y, cat) VALUES(?1, ?2, ?3, ?4)")
                 .map_err(|e| e.to_string())?;
             for row in &self.buf {
-                stmt.execute(params![row.ts, row.x, row.y])
-                    .map_err(|e| e.to_string())?;
+                stmt.execute(params![
+                    row.ts,
+                    row.x,
+                    row.y,
+                    row.cat.as_ref().map(|c| c.as_ref())
+                ])
+                .map_err(|e| e.to_string())?;
             }
         }
         tx.commit().map_err(|e| e.to_string())
@@ -281,13 +324,22 @@ impl TrailRecorder {
              PRAGMA synchronous = NORMAL;
              PRAGMA wal_autocheckpoint = 64;
              CREATE TABLE IF NOT EXISTS trail (
-                 ts INTEGER NOT NULL,
-                 x  INTEGER NOT NULL,
-                 y  INTEGER NOT NULL
+                 ts  INTEGER NOT NULL,
+                 x   INTEGER NOT NULL,
+                 y   INTEGER NOT NULL,
+                 cat TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_trail_ts ON trail(ts);",
         )
         .map_err(|e| format!("初始化 trail.db 失败: {e}"))?;
+        // 老库升级：v5.2.1 之前建的 trail 表没有 cat 列。加列失败多半是
+        // 「列已存在」，容忍即可；其他错误照常报。
+        if let Err(e) = conn.execute("ALTER TABLE trail ADD COLUMN cat TEXT", []) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                eprintln!("[trail] trail 表加 cat 列失败: {msg}");
+            }
+        }
         self.conn = Some(conn);
         Ok(())
     }
@@ -350,6 +402,8 @@ pub struct TrailPoint {
     pub t: i64,
     pub x: i32,
     pub y: i32,
+    /// 采样时前台进程所属的分类 id。None = 锁屏/隐私窗口/未归类/老数据。
+    pub cat: Option<String>,
 }
 
 /// 取 `[from_ts, to_ts]` 区间内的采样点，超过 `max_points` 时按 rowid 等间隔抽稀。
@@ -379,7 +433,7 @@ pub fn points(from_ts: i64, to_ts: i64, max_points: usize) -> Result<Vec<TrailPo
     let stride = ((count as usize) / max + 1) as i64;
     let mut stmt = conn
         .prepare(
-            "SELECT ts, x, y FROM trail \
+            "SELECT ts, x, y, cat FROM trail \
              WHERE ts >= ?1 AND ts <= ?2 AND (rowid % ?3) = 0 \
              ORDER BY ts LIMIT ?4",
         )
@@ -390,6 +444,7 @@ pub fn points(from_ts: i64, to_ts: i64, max_points: usize) -> Result<Vec<TrailPo
                 t: r.get(0)?,
                 x: r.get(1)?,
                 y: r.get(2)?,
+                cat: r.get(3).unwrap_or(None),
             })
         })
         .map_err(|e| e.to_string())?;
