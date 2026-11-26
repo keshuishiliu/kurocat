@@ -27,6 +27,7 @@ static OBS_CONTROL: OnceLock<Mutex<Option<ObsServerControl>>> = OnceLock::new();
 static OBS_CLIENTS: OnceLock<Mutex<Vec<mpsc::SyncSender<String>>>> = OnceLock::new();
 static OBS_CLIENT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static OBS_PRIVACY_ACTIVE: AtomicBool = AtomicBool::new(false);
+static OBS_GAME_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 fn control_slot() -> &'static Mutex<Option<ObsServerControl>> {
     OBS_CONTROL.get_or_init(|| Mutex::new(None))
@@ -52,6 +53,11 @@ pub fn obs_url(port: u16) -> String {
 pub fn set_privacy_active(active: bool) {
     OBS_PRIVACY_ACTIVE.store(active, Ordering::Relaxed);
     broadcast_raw("privacy", if active { "true" } else { "false" });
+}
+
+pub fn set_game_active(active: bool, payload_json: &str) {
+    OBS_GAME_ACTIVE.store(active, Ordering::Relaxed);
+    broadcast_raw("gameActive", payload_json);
 }
 
 /// Non-blocking 1ns fast-path broadcast for high-frequency keyboard/mouse events.
@@ -89,10 +95,12 @@ fn build_state_snapshot_json(app: &AppHandle) -> String {
     let settings = app.state::<AppState>().settings.lock().unwrap().clone();
     let cats = all_cats();
     let privacy = OBS_PRIVACY_ACTIVE.load(Ordering::Relaxed);
+    let game_active = OBS_GAME_ACTIVE.load(Ordering::Relaxed);
     serde_json::to_string(&json!({
         "settings": settings,
         "cats": cats,
         "privacy": privacy,
+        "gameActive": game_active,
     }))
     .unwrap_or_else(|_| "{}".to_string())
 }

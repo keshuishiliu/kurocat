@@ -4,29 +4,12 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>KuroCat OBS Browser Source</title>
-    <style>
-      * {
-        box-sizing: border-box;
-        margin: 0;
-        padding: 0;
-      }
-      html,
-      body {
-        width: 100%;
-        height: 100%;
-        overflow: hidden;
-        background: transparent !important;
-      }
-      #obs-canvas {
-        display: block;
-        width: 100vw;
-        height: 100vh;
-        background: transparent !important;
-      }
-    </style>
+    <link rel="stylesheet" href="/src/obs.css" />
   </head>
   <body>
     <canvas id="obs-canvas" aria-label="KuroCat OBS Transparent Source"></canvas>
+    <canvas id="obs-canvas-3d" class="hidden" aria-label="KuroCat OBS 3D Transparent Source"></canvas>
+    <div id="agent-bubble" class="agent-bubble hidden" role="status" aria-live="polite"></div>
     <script type="module" src="/src/obsMain.ts"></script>
   </body>
 </html>

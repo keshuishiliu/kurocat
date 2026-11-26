@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Emitter};
 
 const REPO_WEB_BASE: &str = "https://github.com/keshuishiliu/kurocat";
@@ -7,6 +8,22 @@ const REPO_API_LATEST: &str = "https://api.github.com/repos/keshuishiliu/kurocat
 const REPO_RELEASES_PAGE: &str = "https://github.com/keshuishiliu/kurocat/releases/latest";
 
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+static LATEST_UPDATE_CACHE: OnceLock<Mutex<Option<UpdateInfo>>> = OnceLock::new();
+
+pub fn get_cached_update_info() -> Option<UpdateInfo> {
+    LATEST_UPDATE_CACHE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+fn store_cached_update_info(info: &UpdateInfo) {
+    if let Ok(mut guard) = LATEST_UPDATE_CACHE.get_or_init(|| Mutex::new(None)).lock() {
+        *guard = Some(info.clone());
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -689,12 +706,31 @@ mod winhttp_client {
 }
 
 #[cfg(windows)]
+fn fetch_json_from_url(url: &str, accept: Option<&str>, timeout_ms: i32) -> Result<String, String> {
+    let ua = format!("KuroCat/{}", CURRENT_VERSION);
+    let mut body = Vec::with_capacity(8192);
+    winhttp_client::get_stream(url, &ua, accept, timeout_ms, |chunk| {
+        if body.len() + chunk.len() > 2 * 1024 * 1024 {
+            return Err("更新接口响应过大".to_string());
+        }
+        body.extend_from_slice(chunk);
+        Ok(())
+    })?;
+
+    let text = String::from_utf8_lossy(&body).trim().to_string();
+    if text.is_empty() {
+        return Err("更新接口返回空响应".to_string());
+    }
+    Ok(text)
+}
+
+#[cfg(windows)]
 fn fetch_latest_release_json() -> Result<String, String> {
     let ua = format!("KuroCat/{}", CURRENT_VERSION);
     // 主通道走 api.github.com（信息全：资产、sha256、说明）；匿名请求每 IP 每小时
     // 只有 60 次配额，共享代理出口 IP 很容易耗尽而返回 403，所以失败时退到
     // github.com 网页端（/releases/latest 302 + expanded_assets），网页端没有这种配额。
-    match fetch_api_json_windows(&ua) {
+    match fetch_json_from_url(REPO_API_LATEST, Some("Accept: application/vnd.github+json\r\n"), 20_000) {
         Ok(text) => Ok(text),
         Err(api_err) => match fetch_release_json_via_web_windows(&ua) {
             Ok(text) => Ok(text),
@@ -703,29 +739,6 @@ fn fetch_latest_release_json() -> Result<String, String> {
     }
 }
 
-#[cfg(windows)]
-fn fetch_api_json_windows(ua: &str) -> Result<String, String> {
-    let mut body = Vec::with_capacity(8192);
-    winhttp_client::get_stream(
-        REPO_API_LATEST,
-        ua,
-        Some("Accept: application/vnd.github+json\r\n"),
-        20_000,
-        |chunk| {
-            if body.len() + chunk.len() > 2 * 1024 * 1024 {
-                return Err("更新接口响应过大".to_string());
-            }
-            body.extend_from_slice(chunk);
-            Ok(())
-        },
-    )?;
-
-    let text = String::from_utf8_lossy(&body).trim().to_string();
-    if text.is_empty() {
-        return Err("GitHub 返回空响应".to_string());
-    }
-    Ok(text)
-}
 
 /// web 兜底：不碰 api.github.com。
 ///
@@ -829,7 +842,7 @@ fn build_web_release_json(tag: &str, names: Vec<String>) -> Result<String, Strin
 #[cfg(not(windows))]
 fn fetch_latest_release_json() -> Result<String, String> {
     // 与 Windows 侧同策略：API 优先（信息全），403/限流等失败退 github.com 网页端。
-    match fetch_api_json_curl() {
+    match fetch_json_from_url(REPO_API_LATEST, "Accept: application/vnd.github+json", "10", "20") {
         Ok(text) => Ok(text),
         Err(api_err) => match fetch_release_json_via_web_curl() {
             Ok(text) => Ok(text),
@@ -839,7 +852,7 @@ fn fetch_latest_release_json() -> Result<String, String> {
 }
 
 #[cfg(not(windows))]
-fn fetch_api_json_curl() -> Result<String, String> {
+fn fetch_json_from_url(url: &str, accept: &str, connect_secs: &str, max_secs: &str) -> Result<String, String> {
     use std::process::Command;
 
     let curl_bin = if cfg!(target_os = "macos") {
@@ -851,14 +864,14 @@ fn fetch_api_json_curl() -> Result<String, String> {
         .args([
             "-fsSL",
             "--connect-timeout",
-            "10",
+            connect_secs,
             "--max-time",
-            "20",
+            max_secs,
             "-H",
             &format!("User-Agent: KuroCat/{}", CURRENT_VERSION),
             "-H",
-            "Accept: application/vnd.github+json",
-            REPO_API_LATEST,
+            accept,
+            url,
         ])
         .output()
         .map_err(|e| format!("无法调用 curl 检查更新: {}", e))?;
@@ -866,7 +879,7 @@ fn fetch_api_json_curl() -> Result<String, String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if stderr.is_empty() {
-            "连接 GitHub 检查更新失败，请检查网络或代理".to_string()
+            "连接更新服务器失败，请检查网络或代理".to_string()
         } else {
             format!("检查更新失败: {}", stderr)
         });
@@ -874,7 +887,7 @@ fn fetch_api_json_curl() -> Result<String, String> {
 
     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if text.is_empty() {
-        return Err("GitHub 返回空响应".to_string());
+        return Err("更新接口返回空响应".to_string());
     }
     Ok(text)
 }
@@ -936,7 +949,7 @@ pub fn check_latest_update() -> Result<UpdateInfo, String> {
     let install_kind = detect_install_kind();
     let asset = select_asset(&rel.assets, install_kind);
 
-    Ok(UpdateInfo {
+    let info = UpdateInfo {
         current_version: CURRENT_VERSION.to_string(),
         latest_version: latest_clean,
         has_update,
@@ -949,7 +962,9 @@ pub fn check_latest_update() -> Result<UpdateInfo, String> {
         asset_size: asset.and_then(|a| a.size),
         install_kind: install_kind.to_string(),
         notes_summary: summarize_notes(rel.body.as_deref()),
-    })
+    };
+    store_cached_update_info(&info);
+    Ok(info)
 }
 
 fn emit_progress(app: &AppHandle, stage: &str, message: impl Into<String>, info: Option<UpdateInfo>) {
@@ -1231,10 +1246,35 @@ fn download_and_verify_windows(url: &str, dest: &PathBuf, expected_sha256: Optio
     Ok(())
 }
 
+/// Launches a Windows installer or newly-replaced binary detached from our kill-on-close
+/// Job Object (`CREATE_BREAKAWAY_FROM_JOB`) so it survives when the current KuroCat exits.
+/// Falls back to a normal spawn if an outer parent Job Object forbids breakaway.
 #[cfg(windows)]
-fn install_windows_update(app: &AppHandle, info: &UpdateInfo) -> Result<(), String> {
+fn spawn_detached_windows<S: AsRef<std::ffi::OsStr>>(
+    program: &std::path::Path,
+    args: &[S],
+) -> std::io::Result<std::process::Child> {
+    use std::os::windows::process::CommandExt;
     use std::process::Command;
 
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
+    if crate::win_has_kill_on_close_job() {
+        let mut detached = Command::new(program);
+        detached.args(args).creation_flags(CREATE_BREAKAWAY_FROM_JOB);
+        match detached.spawn() {
+            Ok(child) => return Ok(child),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let mut normal = Command::new(program);
+    normal.args(args);
+    normal.spawn()
+}
+
+#[cfg(windows)]
+fn install_windows_update(app: &AppHandle, info: &UpdateInfo) -> Result<(), String> {
     if info.install_kind == "windows-win7"
         || info
             .asset_name
@@ -1289,16 +1329,15 @@ fn install_windows_update(app: &AppHandle, info: &UpdateInfo) -> Result<(), Stri
     download_and_verify_windows(url, &target_file, info.asset_sha256.as_deref())?;
 
     if is_setup_installer {
-        // Launch Tauri NSIS installer in passive auto-relaunch update mode (/P /R /UPDATE)
+        // Launch Tauri NSIS installer in passive auto-relaunch update mode (/P /R /UPDATE),
+        // breaking away from our kill-on-close Job Object so it survives `app.exit(0)`.
         emit_progress(
             app,
             "installing",
             format!("校验通过，正在安装 v{} 并重启...", info.latest_version),
             Some(info.clone()),
         );
-        Command::new(&target_file)
-            .args(["/P", "/R", "/UPDATE"])
-            .spawn()
+        spawn_detached_windows(&target_file, &["/P", "/R", "/UPDATE"])
             .map_err(|e| format!("启动安装程序失败: {}", e))?;
         schedule_process_exit(app);
         return Ok(());
@@ -1535,6 +1574,12 @@ fn install_macos_update(app: &AppHandle, info: &UpdateInfo) -> Result<(), String
          if mv '{src}' '{dst}'; then \
            rm -rf '{dst}.bak' '{tmp}'; \
            /usr/bin/xattr -dr com.apple.quarantine '{dst}' 2>/dev/null || true; \
+           REQ=$(/usr/bin/codesign -d -r- '{dst}' 2>&1 || true); \
+           if printf '%s' \"$REQ\" | /usr/bin/grep -q 'cdhash' && ! printf '%s' \"$REQ\" | /usr/bin/grep -q 'anchor apple'; then \
+             /usr/bin/tccutil reset Accessibility com.kurocat.pet >/dev/null 2>&1 || true; \
+             /usr/bin/tccutil reset ListenEvent com.kurocat.pet >/dev/null 2>&1 || true; \
+             sleep 0.2; \
+           fi; \
            /usr/bin/open -n '{dst}'; \
          else \
            if [ -d '{dst}.bak' ]; then mv '{dst}.bak' '{dst}'; fi; \
@@ -1552,9 +1597,14 @@ fn install_macos_update(app: &AppHandle, info: &UpdateInfo) -> Result<(), String
         .spawn()
         .map_err(|e| format!("启动更新脚本失败: {}", e))?;
 
+    // Immediately pause hooks, close overlays & release the single-instance lock so the
+    // NSIS installer or restarted portable binary never hits a file/mutex race (#73, #74).
+    crate::input_hook::set_hooks_paused(true);
+    crate::shutdown_pet_windows();
+
     let app_clone = app.clone();
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(450));
+        std::thread::sleep(std::time::Duration::from_millis(80));
         app_clone.exit(0);
     });
 
@@ -1742,6 +1792,39 @@ mod tests {
             Some("05c1be2c444f5303770f6d59e216bc0ed7b69321fc44368e4ec231405570f950")
         );
         assert_eq!(extract_sha256(&Some("sha256:short".to_string())), None);
+    }
+
+    #[test]
+    fn qianyi_mirror_latest_json_parses_assets_and_digest() {
+        let sample = r#"{
+            "tag_name": "v9.9.9",
+            "html_url": "https://qianyi.one/kurocat/",
+            "body": "Performance & UX update",
+            "assets": [
+                {
+                    "name": "KuroCat-9.9.9-x64-setup.exe",
+                    "browser_download_url": "https://qianyi.one/kurocat/releases/v9.9.9/KuroCat-9.9.9-x64-setup.exe",
+                    "size": 2250000,
+                    "digest": "sha256:05c1be2c444f5303770f6d59e216bc0ed7b69321fc44368e4ec231405570f950"
+                },
+                {
+                    "name": "KuroCat-9.9.9-macos-universal.app.tar.gz",
+                    "browser_download_url": "https://qianyi.one/kurocat/releases/v9.9.9/KuroCat-9.9.9-macos-universal.app.tar.gz",
+                    "size": 3100000,
+                    "digest": "sha256:05c1be2c444f5303770f6d59e216bc0ed7b69321fc44368e4ec231405570f950"
+                }
+            ]
+        }"#;
+        let rel: GhRelease = serde_json::from_str(sample).expect("parse mirror json");
+        assert!(is_newer_version(&rel.tag_name, CURRENT_VERSION));
+        let win_asset = select_asset(&rel.assets, "windows-nsis").expect("select win nsis");
+        assert!(win_asset.browser_download_url.starts_with("https://qianyi.one/"));
+        assert_eq!(
+            extract_sha256(&win_asset.digest).as_deref(),
+            Some("05c1be2c444f5303770f6d59e216bc0ed7b69321fc44368e4ec231405570f950")
+        );
+        let mac_asset = select_asset(&rel.assets, "macos-app").expect("select mac tar.gz");
+        assert!(mac_asset.name.ends_with(".app.tar.gz"));
     }
 
     #[test]

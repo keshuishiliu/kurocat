@@ -1,6 +1,6 @@
 [package]
 name = "kuro-cat-pet"
-version = "4.16.0"
+version = "5.2.0"
 description = "Cross-platform desktop cat typing & mouse companion for Windows and macOS"
 authors = ["Kevin Hao"]
 edition = "2021"
@@ -37,7 +37,7 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSGraphics", "NSScreen", "NSWindow"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSGraphics", "NSScreen", "NSWindow", "NSWorkspace"] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFString", "CFUUID"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSGeometry", "NSNotification", "NSOperation", "NSProcessInfo", "NSString", "NSValue", "block2"] }
 
@@ -51,6 +51,8 @@ windows-sys = { version = "0.59", features = [
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_Storage_FileSystem",
+  "Win32_Security",
+  "Win32_System_JobObjects",
   "Win32_System_LibraryLoader",
   "Win32_System_Registry",
   "Win32_System_Threading",

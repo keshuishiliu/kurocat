@@ -5,8 +5,13 @@ import {
   type TailKeyMode,
 } from './catEngine';
 import { catAudio } from './audio';
+import { AgentCompanionController, type AgentCompanionEvent } from './agentCompanion';
 import { DEFAULT_BUILTIN_CATS, type CatSkinConfig } from './catSkins';
 import type { KeyboardLayoutId } from './keyboardLayout';
+import type { CollarColorId, KuroCatEngine3D } from './catEngine3d';
+
+type ObsRenderMode = '2d' | '3d';
+type ObsHeadphoneMode = 'auto' | 'on' | 'off';
 
 interface ObsAppSettings {
   scale?: number;
@@ -16,6 +21,9 @@ interface ObsAppSettings {
   keyboardOrientation?: KeyboardOrientation;
   tailKeyMode?: TailKeyMode;
   tailKeyIds?: string[];
+  renderMode?: ObsRenderMode;
+  collarColor?: CollarColorId;
+  headphoneMode?: ObsHeadphoneMode;
 }
 
 type InputEvent =
@@ -31,17 +39,55 @@ interface ObsStateSnapshot {
   settings?: ObsAppSettings;
   cats?: CatSkinConfig[];
   privacy?: boolean;
+  gameActive?: boolean;
 }
 
 const canvas = document.getElementById('obs-canvas') as HTMLCanvasElement;
+const canvas3d = document.getElementById('obs-canvas-3d') as HTMLCanvasElement;
+const agentBubbleEl = document.getElementById('agent-bubble') as HTMLDivElement | null;
 const engine = new KuroCatEngine(canvas);
+
+let engine3d: KuroCatEngine3D | null = null;
+let loading3d: Promise<void> | null = null;
+let active3d = false;
+let webglBlocked = false;
+let privacyActive = false;
+let gameActive = false;
+
+const obsAgentCompanion = new AgentCompanionController({
+  bubbleEl: agentBubbleEl,
+  getTarget: () => (active3d && engine3d ? engine3d : engine),
+  is3DTarget: () => Boolean(active3d && engine3d),
+  allowSound: () => false,
+});
 
 // Mute audio inside OBS Browser Source so purring never double-plays on stream
 catAudio.setEnabled(false);
 
-// Optional query overrides for streamers (e.g. /obs?scale=1.15&bubbles=0&breed=ragdoll&layout=108&orient=viewer)
+// Optional query overrides for streamers (e.g. /obs?mode=3d&collar=red&scale=1.15&bubbles=0&breed=ragdoll&layout=108&orient=viewer)
 const params = new URLSearchParams(window.location.search);
 const overrideBreed = params.get('breed')?.trim() || null;
+const overrideModeRaw = params.get('mode')?.trim().toLowerCase() || null;
+const overrideMode: ObsRenderMode | null =
+  overrideModeRaw === '3d' || overrideModeRaw === '3d-flat'
+    ? '3d'
+    : overrideModeRaw === '2d'
+      ? '2d'
+      : null;
+const overrideCollarRaw = params.get('collar')?.trim().toLowerCase() || null;
+const overrideCollar: CollarColorId | null =
+  overrideCollarRaw === 'none' ||
+  overrideCollarRaw === 'red' ||
+  overrideCollarRaw === 'blue' ||
+  overrideCollarRaw === 'pink' ||
+  overrideCollarRaw === 'green'
+    ? overrideCollarRaw
+    : null;
+const overrideHeadphoneRaw = params.get('headphones')?.trim().toLowerCase() || null;
+const overrideHeadphones: ObsHeadphoneMode | null =
+  overrideHeadphoneRaw === 'auto' || overrideHeadphoneRaw === 'on' || overrideHeadphoneRaw === 'off'
+    ? overrideHeadphoneRaw
+    : null;
 const overrideLayout = params.get('layout') === '108' ? '108' : params.get('layout') === '65' ? '65' : null;
 const overrideOrient = params.get('orient') === 'viewer' ? 'viewer' : params.get('orient') === 'cat' ? 'cat' : null;
 const overrideBubbles = params.has('bubbles') ? params.get('bubbles') !== '0' && params.get('bubbles') !== 'false' : null;
@@ -60,7 +106,82 @@ let currentSettings: ObsAppSettings = {
   keyboardOrientation: 'cat',
   tailKeyMode: 'smart',
   tailKeyIds: [...DEFAULT_TAIL_KEY_IDS],
+  renderMode: '3d',
+  collarColor: 'none',
+  headphoneMode: 'off',
 };
+
+function computeObsHeadphonesOn(activeCat: CatSkinConfig | undefined): boolean {
+  if (activeCat?.id === 'dafeiyu') return false;
+  const hm: ObsHeadphoneMode =
+    overrideHeadphones ||
+    (currentSettings.headphoneMode === 'auto' || currentSettings.headphoneMode === 'on'
+      ? currentSettings.headphoneMode
+      : 'off');
+  if (hm === 'on') return true;
+  if (hm === 'off') return false;
+  return gameActive;
+}
+
+function syncObs3D(
+  activeCat: CatSkinConfig | undefined,
+  mode: ObsRenderMode,
+  collar: CollarColorId,
+  layout: KeyboardLayoutId,
+  orient: KeyboardOrientation,
+  tailMode: TailKeyMode,
+  tailIds: string[],
+  showBubbles: boolean,
+): void {
+  const want3d = mode === '3d' && activeCat?.id !== 'dafeiyu' && !webglBlocked;
+  if (!want3d) {
+    if (active3d) {
+      engine3d?.stop();
+      canvas3d.classList.add('hidden');
+      canvas.classList.remove('hidden');
+      engine.resize();
+      engine.start();
+      active3d = false;
+    }
+    return;
+  }
+
+  if (engine3d) {
+    engine3d.showKeyBubbles = showBubbles;
+    engine3d.setRenderStyle('3d');
+    if (activeCat) engine3d.setCatSkin(activeCat);
+    engine3d.setCollar(collar);
+    engine3d.setHeadphones(computeObsHeadphonesOn(activeCat));
+    engine3d.setKeyboardConfig(layout, orient);
+    engine3d.setTailKeyConfig(tailMode, tailIds);
+    engine3d.setRenderScale(overrideScale ?? 1.0);
+    engine3d.setPrivacyMode(privacyActive);
+    if (!active3d) {
+      engine.stop();
+      canvas.classList.add('hidden');
+      canvas3d.classList.remove('hidden');
+      engine3d.resize();
+      engine3d.start();
+      active3d = true;
+    }
+    return;
+  }
+
+  if (!loading3d) {
+    loading3d = import('./catEngine3d')
+      .then(({ KuroCatEngine3D }) => {
+        engine3d = new KuroCatEngine3D(canvas3d, { embedded: false });
+        window.addEventListener('resize', () => engine3d?.resize());
+        applyState();
+      })
+      .catch(() => {
+        webglBlocked = true;
+      })
+      .finally(() => {
+        loading3d = null;
+      });
+  }
+}
 
 function applyState(): void {
   const breedId = overrideBreed || currentSettings.catBreed || 'black';
@@ -78,39 +199,63 @@ function applyState(): void {
   const tailIds = Array.isArray(currentSettings.tailKeyIds)
     ? currentSettings.tailKeyIds
     : [...DEFAULT_TAIL_KEY_IDS];
-
-  engine.showKeyBubbles =
+  const showBubbles =
     overrideBubbles !== null ? overrideBubbles : currentSettings.showKeyBubbles !== false;
+  const mode: ObsRenderMode =
+    overrideMode || (currentSettings.renderMode === '2d' ? '2d' : '3d');
+  const collar: CollarColorId =
+    overrideCollar ||
+    (currentSettings.collarColor === 'red' ||
+    currentSettings.collarColor === 'blue' ||
+    currentSettings.collarColor === 'pink' ||
+    currentSettings.collarColor === 'green'
+      ? currentSettings.collarColor
+      : 'none');
+
+  engine.showKeyBubbles = showBubbles;
   engine.setCatAppearance(activeCat?.id || 'black', activeCat);
+  engine.setHeadphones(computeObsHeadphonesOn(activeCat));
   engine.setKeyboardConfig(layout, orient);
   engine.setTailKeyConfig(tailMode, tailIds);
   engine.setRenderScale(overrideScale ?? 1.0);
+  syncObs3D(activeCat, mode, collar, layout, orient, tailMode, tailIds, showBubbles);
 }
 
 function handleInput(p: InputEvent): void {
   switch (p.kind) {
     case 'keyDown':
-      engine.onKeyDown(p.vk, p.repeat);
+      obsAgentCompanion.notifyRealUserInput();
+      if (active3d && engine3d) engine3d.onKeyDown(p.vk, p.repeat);
+      else engine.onKeyDown(p.vk, p.repeat);
       break;
     case 'keyUp':
-      engine.onKeyUp(p.vk);
+      if (active3d && engine3d) engine3d.onKeyUp(p.vk);
+      else engine.onKeyUp(p.vk);
       break;
     case 'mouseMove':
-      engine.onGlobalMouseMove(p.nx, p.ny);
-      // Drive smooth eye tracking inside OBS from the streamer's normalized screen cursor!
-      engine.onWindowCursor(p.nx, p.ny, false);
+      if (active3d && engine3d) {
+        engine3d.onGlobalMouseMove(p.nx, p.ny);
+        engine3d.onWindowCursor(p.nx, p.ny, false);
+      } else {
+        engine.onGlobalMouseMove(p.nx, p.ny);
+        engine.onWindowCursor(p.nx, p.ny, false);
+      }
       break;
     case 'mouseDown':
-      engine.onMouseDown(p.button);
+      if (active3d && engine3d) engine3d.onMouseDown(p.button);
+      else engine.onMouseDown(p.button);
       break;
     case 'mouseUp':
-      engine.onMouseUp(p.button);
+      if (active3d && engine3d) engine3d.onMouseUp(p.button);
+      else engine.onMouseUp(p.button);
       break;
     case 'mouseWheel':
-      engine.onMouseWheel();
+      if (active3d && engine3d) engine3d.onMouseWheel();
+      else engine.onMouseWheel();
       break;
     case 'privacyTyping':
-      engine.onPrivacyTyping();
+      if (active3d && engine3d) engine3d.onPrivacyTyping();
+      else engine.onPrivacyTyping();
       break;
   }
 }
@@ -128,7 +273,12 @@ function connectStream(): void {
         currentSettings = { ...currentSettings, ...snap.settings };
       }
       if (typeof snap.privacy === 'boolean') {
-        engine.setPrivacyMode(snap.privacy);
+        privacyActive = snap.privacy;
+        engine.setPrivacyMode(privacyActive);
+        engine3d?.setPrivacyMode(privacyActive);
+      }
+      if (typeof snap.gameActive === 'boolean') {
+        gameActive = snap.gameActive;
       }
       applyState();
     } catch {}
@@ -155,7 +305,25 @@ function connectStream(): void {
   es.addEventListener('privacy', (ev) => {
     try {
       const active = JSON.parse((ev as MessageEvent).data) === true;
+      privacyActive = active;
       engine.setPrivacyMode(active);
+      engine3d?.setPrivacyMode(active);
+      obsAgentCompanion.setPrivacyMode(active);
+    } catch {}
+  });
+
+  es.addEventListener('agentEvent', (ev) => {
+    try {
+      const payload = JSON.parse((ev as MessageEvent).data) as AgentCompanionEvent;
+      obsAgentCompanion.handleEvent(payload);
+    } catch {}
+  });
+
+  es.addEventListener('gameActive', (ev) => {
+    try {
+      const parsed = JSON.parse((ev as MessageEvent).data) as boolean | { active?: boolean };
+      gameActive = typeof parsed === 'boolean' ? parsed : Boolean(parsed?.active);
+      applyState();
     } catch {}
   });
 
