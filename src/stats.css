@@ -415,6 +415,26 @@ body {
   flex: none;
 }
 
+/* 轨迹页图例兼分类筛选：可点击 chip，关态半透明 + 删除线 */
+.chart-legend .lg-item.trail-filter {
+  cursor: pointer;
+  user-select: none;
+  padding: 2px 9px;
+  border-radius: 20px;
+  border: 1px solid var(--line-strong);
+  transition: opacity 0.15s ease;
+}
+
+.chart-legend .lg-item.trail-filter:hover {
+  opacity: 0.8;
+}
+
+.chart-legend .lg-item.trail-filter.off {
+  opacity: 0.4;
+  text-decoration: line-through;
+}
+
+
 /* 图表悬浮数值提示（statsChart.ts 动态创建，挂在 body 上） */
 .chart-tip {
   position: fixed;

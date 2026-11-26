@@ -220,7 +220,7 @@ const DEMO_APP_META: Record<string, { name: string; version: string; path: strin
   },
   'kurocat.exe': {
     name: 'Kuro 猫猫宠',
-    version: '5.3.0',
+    version: '5.4.0',
     path: 'D:\\Programs\\kurocat\\KuroCat.exe',
   },
   'windowsterminal.exe': {
@@ -808,7 +808,11 @@ async function loadStats(): Promise<void> {
   $('hour-sum').textContent = hours.length ? `${fmtNum(sumOf(hours))} 次` : '—';
 
   // ---- 按程序排行：全量展示，容器滚动 ----
-  const appRows = appsVisible.filter((r) => r.keydown > 0);
+  // 后端返回的是「按键 + 时长」混合序，击键排行必须自己重排成严格按键数降序，
+  // 否则前台很久但没怎么按键的程序会插到纯按键大户前面。
+  const appRows = appsVisible
+    .filter((r) => r.keydown > 0)
+    .sort((a, b) => b.keydown - a.keydown);
   // 前台时长排行：与击键排行是两回事——看视频、读文档的程序一个键都不按，
   // 但会在这里排在前面。排序必须自己重排，不能沿用后端按「按键 + 时长」的混合序。
   const focusRows = appsVisible
@@ -1394,6 +1398,42 @@ async function ensureAppMetas(labels: string[]): Promise<boolean> {
 let trail: TrailPlayer | null = null;
 let trailLoaded = false;
 let trailPointTotal = 0;
+/** 最近一次加载的原始采样点（未筛选），切换分类筛选时在内存里重放，不重新请求后端 */
+let trailRows: TrailPoint[] = [];
+let trailRangeFrom = 0;
+let trailRangeTo = 0;
+/** 分类筛选：集合内的 key 显示、不在的不显示。首次加载初始化为全选。 */
+const trailFilter = new Set<string>();
+let trailFilterInit = false;
+/** 未归类筛选 key：无 cat、锁屏/隐私期间、以及分类已被删除的点都归这组 */
+const TRAIL_CAT_NONE = '__none__';
+
+/** 采样点 → 筛选 key。分类已被删除的点跟随「未归类」一起筛，不留孤儿项。 */
+function trailFilterKey(p: TrailPoint): string {
+  return p.cat && findCategory(p.cat) ? p.cat : TRAIL_CAT_NONE;
+}
+
+/** 按当前筛选集合过滤点集并重放（光标归零）。副标题同步显示已显示/总数。 */
+function applyTrailFilter(): void {
+  const shown = trailRows.filter((p) => trailFilter.has(trailFilterKey(p)));
+  trail?.setPoints(shown);
+  const sub = $('trail-sub');
+  if (!sub) return;
+  sub.textContent = trailRows.length
+    ? `${fmtNum(shown.length)} / ${fmtNum(trailRows.length)} 个采样点 · ${timeStr(trailRangeFrom)} ~ ${timeStr(trailRangeTo)}`
+    : '只记录坐标与时间，不记录任何画面内容';
+}
+
+/** 筛选集合与这次数据的 key 求交：删掉已不存在的 key，且保证至少剩一个。 */
+function syncTrailFilter(): void {
+  const present = new Set(trailRows.map(trailFilterKey));
+  for (const key of Array.from(trailFilter)) {
+    if (!present.has(key)) trailFilter.delete(key);
+  }
+  if (!trailFilter.size && present.size) {
+    trailFilter.add(present.values().next().value as string);
+  }
+}
 
 function ensureTrailPlayer(): TrailPlayer {
   if (trail) return trail;
@@ -1411,31 +1451,39 @@ function ensureTrailPlayer(): TrailPlayer {
   return trail;
 }
 
-/** 轨迹页图例：只列出这次回放里真实出现过的分类。 */
-function renderTrailLegend(points: TrailPoint[]): void {
+/**
+ * 轨迹页图例兼分类筛选：只列出这次回放里真实出现过的分类，
+ * 点击 chip 切换显示/隐藏（至少保留一个）。
+ */
+function renderTrailLegend(): void {
   const el = document.getElementById('trail-legend');
   if (!el) return;
-  const seen = new Set<string>();
-  let hasUncategorized = false;
-  for (const p of points) {
-    if (p.cat) seen.add(p.cat);
-    else hasUncategorized = true;
+  const order: string[] = [];
+  let hasNone = false;
+  for (const p of trailRows) {
+    const key = trailFilterKey(p);
+    if (key === TRAIL_CAT_NONE) hasNone = true;
+    else if (!order.includes(key)) order.push(key);
   }
   const items: string[] = [];
-  for (const id of seen) {
+  for (const id of order) {
     const c = findCategory(id);
-    if (!c) continue; // 分类已被删除：着色时同样落灰，图例里显示未归类即可
-    items.push(
-      `<span class="lg-item"><i class="lg-dot" style="background:${escapeHtml(c.color)}"></i>${escapeHtml(c.name)}</span>`,
-    );
-    hasUncategorized = false; // 有已删除分类的点也会画灰，一并算未归类
+    if (!c) {
+      // 分类已被删除：点会画灰，归入未归类
+      hasNone = true;
+      continue;
+    }
+    items.push(trailFilterChip(id, c.name, c.color));
   }
-  if (hasUncategorized) {
-    items.push(
-      '<span class="lg-item"><i class="lg-dot" style="background:#8b909c"></i>未归类</span>',
-    );
+  if (hasNone) {
+    items.push(trailFilterChip(TRAIL_CAT_NONE, '未归类', '#8b909c'));
   }
   el.innerHTML = items.join('');
+}
+
+function trailFilterChip(key: string, name: string, color: string): string {
+  const off = trailFilter.has(key) ? '' : ' off';
+  return `<span class="lg-item trail-filter${off}" data-cat-key="${escapeHtml(key)}" role="button" title="点击显示/隐藏该分类"><i class="lg-dot" style="background:${escapeHtml(color)}"></i>${escapeHtml(name)}</span>`;
 }
 
 function updateTrailAvailability(): void {
@@ -1457,7 +1505,8 @@ function updateTrailAvailability(): void {
 }
 
 async function loadTrail(): Promise<void> {
-  const player = ensureTrailPlayer();
+  // 确保播放器（含分类着色注入）已就绪，applyTrailFilter 里的 setPoints 才有归宿
+  ensureTrailPlayer();
   const from = fromInputValue(($('trail-from') as HTMLInputElement).value);
   const to = fromInputValue(($('trail-to') as HTMLInputElement).value);
   if (!from || !to || to <= from) {
@@ -1468,13 +1517,21 @@ async function loadTrail(): Promise<void> {
     call<TrailPoint[]>('input_log_trail_points', { from, to, maxPoints: 12000 }),
   );
   const rows = points ?? [];
+  trailRows = rows;
   trailPointTotal = rows.length;
-  player.setPoints(rows);
-  renderTrailLegend(rows);
+  trailRangeFrom = from;
+  trailRangeTo = to;
+  if (!trailFilterInit) {
+    // 首次加载：全选所有出现过的分类
+    for (const p of rows) trailFilter.add(trailFilterKey(p));
+    trailFilterInit = true;
+  } else {
+    // 时间范围变了：这次数据里没有的 key 会被剪掉（syncTrailFilter 保证至少剩一个）
+    syncTrailFilter();
+  }
+  renderTrailLegend();
+  applyTrailFilter();
   trailLoaded = true;
-  $('trail-sub').textContent = rows.length
-    ? `${fmtNum(rows.length)} 个采样点 · ${timeStr(from)} ~ ${timeStr(to)}`
-    : '只记录坐标与时间，不记录任何画面内容';
   updateTrailAvailability();
   if (!rows.length && status?.trailEnabled === false) {
     toast('轨迹采样还没开启，先到设置里打开');
@@ -2030,6 +2087,24 @@ function bindEvents(): void {
     if (trail) trail.setSpeed(speed);
   });
 
+  // 图例 chip = 分类筛选开关（至少保留一个分类）
+  $('trail-legend').addEventListener('click', (ev) => {
+    const chip = (ev.target as HTMLElement).closest<HTMLElement>('.trail-filter');
+    const key = chip?.dataset.catKey;
+    if (!key) return;
+    if (trailFilter.has(key)) {
+      if (trailFilter.size <= 1) {
+        toast('至少保留一个分类');
+        return;
+      }
+      trailFilter.delete(key);
+    } else {
+      trailFilter.add(key);
+    }
+    renderTrailLegend();
+    applyTrailFilter();
+  });
+
   // 全屏播放：舞台 + 控制条一起进全屏，Esc、双击画布或再点一次按钮退出
   const toggleTrailFullscreen = (): void => {
     if (document.fullscreenElement) {
@@ -2085,6 +2160,10 @@ function bindEvents(): void {
       toast('已清空全部输入记录');
       trailPointTotal = 0;
       trailLoaded = false;
+      trailRows = [];
+      trailFilter.clear();
+      trailFilterInit = false;
+      renderTrailLegend();
       trail?.setPoints([]);
       updateTrailAvailability();
       await refreshStatus();
@@ -2132,6 +2211,15 @@ async function boot(): Promise<void> {
     renderAppCategoryList();
     // 轨迹着色与图例也依赖分类设置：colorFor 是动态取的，重设一次触发重绘
     trail?.setCategoryColors((cat) => findCategory(cat)?.color ?? '#8b909c');
+    // 图例筛选依赖分类存在性：分类被删会让部分 key 失效，需要修剪筛选集并重放；
+    // 仅改名/换色时只刷新图例文案与颜色，不打断播放进度
+    if (trailLoaded && trailRows.length) {
+      const before = Array.from(trailFilter);
+      syncTrailFilter();
+      const pruned = before.length !== trailFilter.size;
+      renderTrailLegend();
+      if (pruned) applyTrailFilter();
+    }
     if (document.getElementById('page-stats')?.classList.contains('active')) void loadStats();
   });
   // 自定义名 / 忽略变了：列表立即重画（改名会变标题，忽略会影响统计口径）

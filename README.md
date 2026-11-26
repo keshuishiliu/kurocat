@@ -5,9 +5,9 @@
 
 # 🐈‍⬛ KuroCat（衍生修改版）
 
-**当前版本 `v5.3.0`**（= 上游 v5.1.2 + 本仓库改动：输入统计、数据同步、便携版更新、网页端 403 兜底等）。App 内「检查更新」与更新包地址校验已改为锚定本仓库 [keshuishiliu/kurocat](https://github.com/keshuishiliu/kurocat) Releases，不再跟随上游发布通道。
+**当前版本 `v5.4.0`**（= 上游 v5.1.2 + 本仓库改动：输入统计、数据同步、便携版更新、网页端 403 兜底等）。App 内「检查更新」与更新包地址校验已改为锚定本仓库 [keshuishiliu/kurocat](https://github.com/keshuishiliu/kurocat) Releases，不再跟随上游发布通道。
 
-**下载**：[Releases · v5.3.0](https://github.com/keshuishiliu/kurocat/releases/latest) —— Windows 安装包 / **Windows 免安装版（exe 与 zip）** / macOS Universal `dmg` / Linux `deb` + `AppImage`，由 GitHub Actions 三平台构建，安装包未签名。
+**下载**：[Releases · v5.4.0](https://github.com/keshuishiliu/kurocat/releases/latest) —— Windows 安装包 / **Windows 免安装版（exe 与 zip）** / macOS Universal `dmg` / Linux `deb` + `AppImage`，由 GitHub Actions 三平台构建，安装包未签名。
 
 ## 目录
 
