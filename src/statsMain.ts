@@ -220,7 +220,7 @@ const DEMO_APP_META: Record<string, { name: string; version: string; path: strin
   },
   'kurocat.exe': {
     name: 'Kuro 猫猫宠',
-    version: '5.4.1',
+    version: '5.5.0',
     path: 'D:\\Programs\\kurocat\\KuroCat.exe',
   },
   'windowsterminal.exe': {
@@ -1054,6 +1054,9 @@ function appInitial(label: string): string {
   return ch ? ch.toUpperCase() : '?';
 }
 
+/** 展示名排序：中文按拼音、英文按字母，忽略大小写。 */
+const appTitleCollator = new Intl.Collator('zh-Hans-CN', { numeric: true, sensitivity: 'base' });
+
 /** 「今天 / 昨天 / 3 天前 / 2 个月前」，按日历天算，不看时刻。 */
 function lastSeenText(process: string): string {
   const day = appLastDays.get(process.toLowerCase());
@@ -1104,6 +1107,7 @@ function renderAppCategoryList(): void {
       .toLowerCase();
     return hay.includes(filter);
   });
+  rows.sort((a, b) => appTitleCollator.compare(appTitle(a.label), appTitle(b.label)));
 
   renderAppCatChips();
 
