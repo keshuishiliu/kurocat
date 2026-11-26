@@ -1375,8 +1375,6 @@ fn install_windows_update(app: &AppHandle, info: &UpdateInfo) -> Result<(), Stri
 /// 回滚到旧 exe，保证程序始终有一个可运行的二进制。
 #[cfg(windows)]
 pub fn apply_portable_update(app: &AppHandle) -> Result<(), String> {
-    use std::process::Command;
-
     let Some(pending) = read_pending_portable_update() else {
         return Err("没有已下载的更新包，请先检查更新".to_string());
     };
@@ -1414,15 +1412,19 @@ pub fn apply_portable_update(app: &AppHandle) -> Result<(), String> {
     let _ = std::fs::remove_file(&update_file);
     clear_pending_portable_update();
 
-    if let Err(e) = Command::new(&current_exe)
-        .args([
+    // 必须走 spawn_detached_windows：我们跑在 kill-on-close 的 Job Object 里（清理
+    // WebView2 孤儿用），普通 spawn 的子进程会被连带编进 Job；旧进程 app.exit(0)
+    // 关闭 Job 句柄时，内核会把还在 --wait-pid 等待的新进程直接杀掉，更新后就不自启
+    // （v5.3.0 / v5.4.0 两次复现）。BREAKAWAY 让新进程脱离 Job 才能活下来。
+    if let Err(e) = spawn_detached_windows(
+        &current_exe,
+        &[
             "--wait-pid",
             &pid.to_string(),
             "--cleanup-old-exe",
             &old_exe.to_string_lossy(),
-        ])
-        .spawn()
-    {
+        ],
+    ) {
         let _ = std::fs::remove_file(&current_exe);
         let _ = std::fs::rename(&old_exe, &current_exe);
         return Err(format!("启动新版本程序失败: {}", e));

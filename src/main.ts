@@ -121,7 +121,7 @@ function saveDismissedVersion(version: string): void {
   }
 }
 
-let appVersion = '5.4.0';
+let appVersion = '5.4.1';
 let latestUpdateInfo: UpdateInfo | null = null;
 let updateBusy = false;
 let dismissedVersion: string | null = loadDismissedVersion();
