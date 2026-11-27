@@ -19,3 +19,6 @@ android/app/src/main/assets/web/
 *.keystore
 *.apk
 *.aab
+
+# 便携工具（perl 等），纯本机工作用，不进仓库
+tools/

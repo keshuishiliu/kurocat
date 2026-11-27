@@ -1,6 +1,6 @@
 [package]
 name = "kuro-cat-pet"
-version = "5.5.0"
+version = "5.6.0"
 description = "Cross-platform desktop cat typing & mouse companion for Windows and macOS"
 authors = ["Kevin Hao"]
 edition = "2021"
@@ -26,7 +26,19 @@ tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-ap
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # 输入记录存储。bundled 自带 SQLite 源码，不依赖系统库，Windows/macOS 行为一致。
-rusqlite = { version = "0.32", features = ["bundled"] }
+# bundled-sqlcipher：整库 AES-256 加密（防拷走）；Windows/macOS 都走 vendored OpenSSL
+# （macOS 也可用 CommonCrypto，但统一走一条 feature 避免条件差异；openssl-src 缺 NASM 时自动 no-asm）。
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
+# 录入库密钥保管：Windows DPAPI / macOS Keychain / Linux 内核 keyutils。
+# keyring v3 起平台后端必须显式启用 feature，默认一个都没有。
+# Linux 用 linux-native（keyutils，无系统库依赖，CI 不用装 libdbus）。
+keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native"] }
+# 同步包加密（AES-256-GCM）与密码验证（PBKDF2-HMAC-SHA256，pbkdf2 默认带 hmac）。
+aes-gcm = "0.10"
+pbkdf2 = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+base64 = "0.22"
 # 本地时区换算（ts → 本地日期/小时）。不用 SQL 的 'localtime' 修饰符：它依赖运行环境时区，
 # 不同机器会给出不同结果。clock feature 提供 Local。
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

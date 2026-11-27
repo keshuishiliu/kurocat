@@ -2,7 +2,10 @@
 
 mod appmeta;
 mod cats;
+mod backup;
 mod config;
+// crypto 需要对 example 可见（examples/crypto_e2e.rs 端到端验证用），rlib 不单独分发，无泄露面。
+pub mod crypto;
 mod game_detect;
 mod i18n;
 mod input_hook;
@@ -30,8 +33,9 @@ use config::{
     normalize_app_ignored, normalize_categories, normalize_input_log_active_gap,
     normalize_input_log_retention,
     normalize_keyboard_layout, normalize_keyboard_orientation, normalize_sync_settings,
+    normalize_backup_interval, normalize_backup_retention,
     normalize_tail_key_ids, normalize_tail_key_mode, save_settings, set_windows_autostart,
-    try_save_settings, AppSettings, CategoryDef, SyncSettings,
+    try_save_settings, AppSettings, BackupSettings, CategoryDef, SyncSettings,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -279,6 +283,9 @@ pub struct AppState {
     pub mcp_enabled: Arc<AtomicBool>,
     pub update_banner_open: Arc<AtomicBool>,
     pub paused_guard: Arc<AtomicBool>,
+    /// 录入设置区门禁的本次运行解锁态。进程重启即失效——
+    /// 「输一次管一次运行」的正确语义就是放在内存里，绝不落盘。
+    pub input_log_unlocked: Arc<Mutex<bool>>,
 }
 
 /// Shared Chromium / WebView2 lean runtime flags.
@@ -641,13 +648,22 @@ fn update_settings(app: AppHandle, state: State<'_, AppState>, mut patch: AppSet
         // 轨迹开关同理由 input_log_set_trail 独占：宠物窗口不会改它，
         // 但它手里那份设置可能是几小时前的快照，覆盖回去等于偷偷关掉采样。
         patch.input_log_trail_recording = s.input_log_trail_recording;
+        // 录入密码哈希由 input_log_password_* 命令独占写入口。宠物窗口
+        // 快照里这个字段必然是 None（前端不携带），覆盖回去等于密码被清掉。
+        patch.input_log_password_hash = s.input_log_password_hash.clone();
         // 数据同步配置由统计窗口的 sync_configure 独占，理由同上。
         patch.sync = s.sync.clone();
+        // 备份配置由统计窗口的 backup_configure 独占，理由同上。
+        patch.backup = s.backup.clone();
         *s = patch.clone();
         save_settings(&s);
     }
     // 输入记录开关同步到 recorder 线程。默认关闭，只有用户显式打开才会落盘。
-    let recording = patch.input_log_enabled && !patch.input_log_paused;
+    // 门禁：没设密码时，任何设置入口（含宠物窗口快照）都不能把录制打开。
+    if patch.input_log_password_hash.is_none() {
+        patch.input_log_enabled = false;
+    }
+    let recording = recording_allowed(&patch);
     recorder::set_enabled(recording);
     recorder::set_gap_minutes(patch.input_log_active_gap_minutes);
     trail::set_enabled(recording && patch.input_log_trail_recording);
@@ -667,10 +683,165 @@ fn update_settings(app: AppHandle, state: State<'_, AppState>, mut patch: AppSet
 // 安全承诺：这组命令**永远不许出现在 MCP 工具表**里。MCP 与 OBS 都监听
 // 127.0.0.1，一旦它们能调用下面任何一个函数，「改外观的接口」就变成
 // 「导出全部输入历史的接口」。加新工具前先回想这一条。
+//
+// 门禁约定（v5.6.0 起）：录入数据是「按键 + 时间」，可以复现输入内容。
+// 因此开启录制必须先设访问密码；已设密码后，本节**所有**读写命令
+// （含统计查询类）都要求「本次运行已解锁」，否则返回 `LOCKED:` 前缀
+// 的错误给前端弹解锁界面。密码命令本身不受门禁。
 // ---------------------------------------------------------------------------
 
+/// 门禁检查。错误以 `LOCKED:` 开头，前端据此弹出设置/解锁界面。
+fn require_input_log_unlocked(state: &State<'_, AppState>) -> Result<(), String> {
+    let s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+    if s.input_log_password_hash.is_none() {
+        return Err("LOCKED:未设置访问密码".to_string());
+    }
+    if !*state
+        .input_log_unlocked
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    {
+        return Err("LOCKED:需要解锁".to_string());
+    }
+    Ok(())
+}
+
+fn input_log_password_min_len() -> usize {
+    4
+}
+
+fn validate_password_len(password: &str) -> Result<(), String> {
+    if password.chars().count() < input_log_password_min_len() {
+        return Err(format!("密码至少 {} 位", input_log_password_min_len()));
+    }
+    Ok(())
+}
+
+/// 开启录制/轨迹的统一入口条件：总开关 && 未暂停 && 已设密码。
+/// recorder/trail 的拉起必须走这里，别处手写容易漏掉密码条件。
+fn recording_allowed(s: &AppSettings) -> bool {
+    s.input_log_enabled && !s.input_log_paused && s.input_log_password_hash.is_some()
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InputLogPasswordStatus {
+    set: bool,
+    unlocked: bool,
+}
+
 #[tauri::command]
-fn input_log_stats(state: State<'_, AppState>) -> recorder::LogStatus {
+fn input_log_password_status(state: State<'_, AppState>) -> InputLogPasswordStatus {
+    let s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+    InputLogPasswordStatus {
+        set: s.input_log_password_hash.is_some(),
+        unlocked: *state
+            .input_log_unlocked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+    }
+}
+
+/// 首次设置密码。设置后本运行视为已解锁；若开关本来就开着，
+/// 立刻把被门禁压制的录制拉起来。
+#[tauri::command]
+fn input_log_password_set(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    password: String,
+) -> Result<InputLogPasswordStatus, String> {
+    validate_password_len(&password)?;
+    {
+        let mut s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+        if s.input_log_password_hash.is_some() {
+            return Err("密码已设置，请用修改密码功能".to_string());
+        }
+        s.input_log_password_hash = Some(crate::crypto::hash_password(&password));
+        save_settings(&s);
+        *state.input_log_unlocked.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        let allowed = recording_allowed(&s);
+        let gap = s.input_log_active_gap_minutes;
+        let trail_on = allowed && s.input_log_trail_recording;
+        drop(s);
+        // 录制在启动期可能被门禁压制过，现在正式放行
+        recorder::set_enabled(allowed);
+        recorder::set_gap_minutes(gap);
+        trail::set_enabled(trail_on);
+    }
+    let _ = app.emit("kuro-settings", state.settings.lock().unwrap().clone());
+    Ok(input_log_password_status(state))
+}
+
+/// 解锁本次运行。密码错误返回 Ok(false)，配置错误才返回 Err。
+#[tauri::command]
+fn input_log_password_verify(
+    state: State<'_, AppState>,
+    password: String,
+) -> Result<InputLogPasswordStatus, String> {
+    let hash = {
+        let s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+        s.input_log_password_hash
+            .clone()
+            .ok_or("尚未设置访问密码")?
+    };
+    if crate::crypto::verify_password(&password, &hash) {
+        *state
+            .input_log_unlocked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = true;
+    }
+    Ok(input_log_password_status(state))
+}
+
+/// 修改密码：必须先验旧密码。
+#[tauri::command]
+fn input_log_password_change(
+    state: State<'_, AppState>,
+    old_password: String,
+    new_password: String,
+) -> Result<InputLogPasswordStatus, String> {
+    validate_password_len(&new_password)?;
+    let hash = {
+        let s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+        s.input_log_password_hash
+            .clone()
+            .ok_or("尚未设置访问密码")?
+    };
+    if !crate::crypto::verify_password(&old_password, &hash) {
+        return Err("原密码不正确".to_string());
+    }
+    {
+        let mut s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+        s.input_log_password_hash = Some(crate::crypto::hash_password(&new_password));
+        save_settings(&s);
+    }
+    Ok(input_log_password_status(state))
+}
+
+/// 重置密码（免旧密码）。
+///
+/// 适用场景：忘记密码。DPAPI 方案下库密钥与密码无关，数据不受影响；
+/// 代价是任何能操作本机的人都能走这条路——本方案里密码只拦「顺手偷看」，
+/// 不拦蓄意攻击者，这是设计上明说的取舍。
+#[tauri::command]
+fn input_log_password_reset(
+    state: State<'_, AppState>,
+    new_password: String,
+) -> Result<InputLogPasswordStatus, String> {
+    validate_password_len(&new_password)?;
+    {
+        let mut s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+        s.input_log_password_hash = Some(crate::crypto::hash_password(&new_password));
+        save_settings(&s);
+        // 重置视为一次完整接管：本运行直接解锁
+        *state.input_log_unlocked.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    }
+    Ok(input_log_password_status(state))
+}
+
+#[tauri::command]
+fn input_log_stats(state: State<'_, AppState>) -> Result<recorder::LogStatus, String> {
+    require_input_log_unlocked(&state)?;
     let (enabled, paused, retention, gap, trail_on) = {
         let s = state.settings.lock().unwrap();
         (
@@ -681,7 +852,7 @@ fn input_log_stats(state: State<'_, AppState>) -> recorder::LogStatus {
             s.input_log_trail_recording,
         )
     };
-    recorder::status(enabled, paused, retention, gap, trail_on)
+    Ok(recorder::status(enabled, paused, retention, gap, trail_on))
 }
 
 /// 只改三个**不动数据**的字段：开关、暂停、活跃判定阈值。
@@ -693,7 +864,8 @@ fn input_log_configure(
     enabled: bool,
     paused: bool,
     gap_minutes: u32,
-) -> recorder::LogStatus {
+) -> Result<recorder::LogStatus, String> {
+    require_input_log_unlocked(&state)?;
     // 一次加锁内完成「读→改→写」，避免与其他窗口的并发设置更新互相覆盖
     let next = {
         let mut guard = state.settings.lock().unwrap();
@@ -703,17 +875,17 @@ fn input_log_configure(
         save_settings(&guard);
         guard.clone()
     };
-    recorder::set_enabled(enabled && !paused);
+    recorder::set_enabled(recording_allowed(&next));
     recorder::set_gap_minutes(next.input_log_active_gap_minutes);
-    trail::set_enabled(enabled && !paused && next.input_log_trail_recording);
+    trail::set_enabled(recording_allowed(&next) && next.input_log_trail_recording);
     let _ = app.emit("kuro-settings", next.clone());
-    recorder::status(
+    Ok(recorder::status(
         next.input_log_enabled,
         next.input_log_paused,
         next.input_log_retention_days,
         next.input_log_active_gap_minutes,
         next.input_log_trail_recording,
-    )
+    ))
 }
 
 /// 轨迹采样开关。与「记录输入」分开：关掉明细但留着轨迹是合理需求（反之亦然）。
@@ -722,35 +894,39 @@ fn input_log_set_trail(
     app: AppHandle,
     state: State<'_, AppState>,
     enabled: bool,
-) -> recorder::LogStatus {
+) -> Result<recorder::LogStatus, String> {
+    require_input_log_unlocked(&state)?;
     let next = {
         let mut guard = state.settings.lock().unwrap();
         guard.input_log_trail_recording = enabled;
         save_settings(&guard);
         guard.clone()
     };
-    trail::set_enabled(next.input_log_enabled && !next.input_log_paused && enabled);
+    trail::set_enabled(recording_allowed(&next) && enabled);
     let _ = app.emit("kuro-settings", next.clone());
-    recorder::status(
+    Ok(recorder::status(
         next.input_log_enabled,
         next.input_log_paused,
         next.input_log_retention_days,
         next.input_log_active_gap_minutes,
         next.input_log_trail_recording,
-    )
+    ))
 }
 
 #[tauri::command]
-fn input_log_trail_range() -> trail::TrailRange {
-    trail::range()
+fn input_log_trail_range(state: State<'_, AppState>) -> Result<trail::TrailRange, String> {
+    require_input_log_unlocked(&state)?;
+    Ok(trail::range())
 }
 
 #[tauri::command]
 fn input_log_trail_points(
+    state: State<'_, AppState>,
     from: i64,
     to: i64,
     max_points: usize,
 ) -> Result<Vec<trail::TrailPoint>, String> {
+    require_input_log_unlocked(&state)?;
     trail::points(from, to, max_points)
 }
 
@@ -799,10 +975,12 @@ fn categories_save(
 
 #[tauri::command]
 fn input_log_summary(
+    state: State<'_, AppState>,
     from: String,
     to: String,
     dim: recorder::SummaryDim,
 ) -> Result<Vec<recorder::SummaryPoint>, String> {
+    require_input_log_unlocked(&state)?;
     recorder::summary(&from, &to, dim)
 }
 
@@ -813,6 +991,7 @@ fn input_log_category_summary(
     from: String,
     to: String,
 ) -> Result<recorder::CategorySummary, String> {
+    require_input_log_unlocked(&state)?;
     let cat_by_process: std::collections::HashMap<String, String> = state
         .settings
         .lock()
@@ -827,10 +1006,12 @@ fn input_log_category_summary(
 /// 单个应用的统计（键鼠汇总、按日趋势、前台热力图、top 按键）。
 #[tauri::command]
 fn input_log_app_stats(
+    state: State<'_, AppState>,
     process: String,
     from: String,
     to: String,
 ) -> Result<recorder::AppStats, String> {
+    require_input_log_unlocked(&state)?;
     recorder::app_stats(&process, &from, &to)
 }
 
@@ -963,6 +1144,70 @@ async fn sync_now() -> Result<sync::SyncOutcome, String> {
         .map_err(|e| format!("任务失败: {e}"))?
 }
 
+// ---------------------------------------------------------------------------
+// 数据备份（快照上传 + 按时间点恢复）。全部走录入密码门禁：
+// 快照与恢复都是整库数据的进出通道，比统计查询更敏感。
+// ---------------------------------------------------------------------------
+
+/// 保存备份设置。宠物窗口的 update_settings 会强制保留这份配置。
+#[tauri::command]
+fn backup_configure(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    backup: BackupSettings,
+) -> Result<BackupSettings, String> {
+    require_input_log_unlocked(&state)?;
+    let mut clean = backup;
+    clean.interval_minutes = normalize_backup_interval(clean.interval_minutes);
+    clean.retention_days = normalize_backup_retention(clean.retention_days);
+    {
+        let mut s = state.settings.lock().unwrap();
+        s.backup = clean.clone();
+        save_settings(&s);
+    }
+    let settings_arc = state.settings.clone();
+    backup::apply_settings(&settings_arc);
+    let snapshot = state.settings.lock().unwrap().clone();
+    let _ = app.emit("kuro-settings", snapshot);
+    Ok(clean)
+}
+
+/// 备份状态（开关/间隔/保留/上次结果）。不含任何输入数据，无需门禁。
+#[tauri::command]
+fn backup_status() -> backup::BackupStatus {
+    backup::status()
+}
+
+/// 立即备份一次。网络 + 整库导出，放阻塞线程池。
+#[tauri::command]
+async fn backup_run_now(state: State<'_, AppState>) -> Result<backup::SnapshotMeta, String> {
+    require_input_log_unlocked(&state)?;
+    tauri::async_runtime::spawn_blocking(backup::backup_now)
+        .await
+        .map_err(|e| format!("任务失败: {e}"))?
+}
+
+/// 列出云端可恢复的快照。
+#[tauri::command]
+async fn backup_list(state: State<'_, AppState>) -> Result<Vec<backup::SnapshotMeta>, String> {
+    require_input_log_unlocked(&state)?;
+    tauri::async_runtime::spawn_blocking(backup::list_snapshots)
+        .await
+        .map_err(|e| format!("任务失败: {e}"))?
+}
+
+/// 恢复到某个时间点。**不可逆操作**（现有数据进防呆目录），前端必须二次确认。
+#[tauri::command]
+async fn backup_restore(
+    state: State<'_, AppState>,
+    ts: i64,
+) -> Result<backup::RestoreReport, String> {
+    require_input_log_unlocked(&state)?;
+    tauri::async_runtime::spawn_blocking(move || backup::restore(ts))
+        .await
+        .map_err(|e| format!("任务失败: {e}"))?
+}
+
 /// 批量解析应用元信息（exe 路径、显示名、版本、图标）。
 /// 图标要读 exe 资源，几十个程序可能耗一两秒，必须丢进阻塞线程池，不能堵 UI 线程。
 #[tauri::command]
@@ -974,7 +1219,12 @@ async fn app_meta_get(processes: Vec<String>) -> Result<Vec<appmeta::AppMeta>, S
 
 /// 每个程序最后一次有记录的日期，前端用来显示「今天 / 3 天前」。
 #[tauri::command]
-fn input_log_app_activity(from: String, to: String) -> Result<Vec<recorder::AppActivity>, String> {
+fn input_log_app_activity(
+    state: State<'_, AppState>,
+    from: String,
+    to: String,
+) -> Result<Vec<recorder::AppActivity>, String> {
+    require_input_log_unlocked(&state)?;
     recorder::app_last_seen(&from, &to)
 }
 
@@ -1009,7 +1259,11 @@ fn open_path_folder(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn input_log_retention_preview(days: u32) -> Result<recorder::RetentionPreview, String> {
+fn input_log_retention_preview(
+    state: State<'_, AppState>,
+    days: u32,
+) -> Result<recorder::RetentionPreview, String> {
+    require_input_log_unlocked(&state)?;
     recorder::retention_preview(normalize_input_log_retention(days))
 }
 
@@ -1020,6 +1274,7 @@ fn input_log_apply_retention(
     state: State<'_, AppState>,
     days: u32,
 ) -> Result<recorder::RetentionReport, String> {
+    require_input_log_unlocked(&state)?;
     let days = normalize_input_log_retention(days);
     let report = recorder::apply_retention(days)?;
     // 轨迹库独立，明细清完之后顺手把同一时间点之前的采样一起删掉。
@@ -1044,7 +1299,8 @@ fn input_log_apply_retention(
 
 /// 删掉整个日志目录，不留残余。
 #[tauri::command]
-fn input_log_clear() -> Result<(), String> {
+fn input_log_clear(state: State<'_, AppState>) -> Result<(), String> {
+    require_input_log_unlocked(&state)?;
     // 先收掉轨迹连接的句柄，否则 Windows 上 input-log 目录删不掉
     trail::wipe();
     recorder::wipe_all()?;
@@ -1062,7 +1318,8 @@ struct InputLogExport {
 }
 
 #[tauri::command]
-fn input_log_export(days: u32) -> Result<InputLogExport, String> {
+fn input_log_export(state: State<'_, AppState>, days: u32) -> Result<InputLogExport, String> {
+    require_input_log_unlocked(&state)?;
     let days = days.clamp(1, 36_500);
     let to_ts = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -3334,6 +3591,7 @@ pub fn run() {
             mcp_enabled,
             update_banner_open,
             paused_guard,
+            input_log_unlocked: Arc::new(Mutex::new(false)),
         })
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -3433,20 +3691,24 @@ pub fn run() {
             }
 
             tray::setup_tray(&handle, &s)?;
-            // 输入记录器：默认关闭，只有 settings 里显式打开才会落盘
-            recorder::init(
-                s.input_log_enabled && !s.input_log_paused,
-                s.input_log_active_gap_minutes,
-            );
+            // 输入记录器：默认关闭，只有 settings 里显式打开才会落盘。
+            // 门禁约束：开启录制必须已设录入访问密码——没设时启动期压制录制，
+            // 用户在统计窗口设置密码后由 input_log_password_set 重新拉起。
+            let recording_allowed =
+                s.input_log_enabled && !s.input_log_paused && s.input_log_password_hash.is_some();
+            recorder::init(recording_allowed, s.input_log_active_gap_minutes);
             // 用户忽略名单：启动时灌给 recorder，之后的增改由 app_overrides_save 推送
             let ignored: Vec<String> = s.app_ignored.keys().cloned().collect();
             recorder::set_ignored_apps(&ignored);
-            // 轨迹采样：三件事同时成立才开始落盘（总开关、未暂停、轨迹开关）
+            // 轨迹采样：三件事同时成立才开始落盘（总开关、未暂停、轨迹开关），
+            // 同样受「已设密码」门禁约束
             trail::init(
-                s.input_log_enabled && !s.input_log_paused && s.input_log_trail_recording,
+                recording_allowed && s.input_log_trail_recording,
             );
             // 轨迹着色用的「进程 → 分类」映射：启动时灌一份，之后 categories_save 推送
             trail::set_category_map(s.app_categories.clone().into_iter().collect());
+            // 数据备份：worker 全程存活；复用 sync 的 WebDAV 配置，独立开关
+            backup::init(handle.state::<AppState>().settings.clone());
             // 数据同步：worker 全程存活，启动同步只在实际启用时发生
             sync::init(
                 handle.clone(),
@@ -3622,6 +3884,11 @@ pub fn run() {
             input_log_set_trail,
             input_log_trail_range,
             input_log_trail_points,
+            input_log_password_status,
+            input_log_password_set,
+            input_log_password_verify,
+            input_log_password_change,
+            input_log_password_reset,
             categories_get,
             categories_save,
             input_log_app_stats,
@@ -3631,6 +3898,11 @@ pub fn run() {
             sync_get_status,
             sync_test_connection,
             sync_now,
+            backup_configure,
+            backup_status,
+            backup_run_now,
+            backup_list,
+            backup_restore,
             open_stats_window,
         ])
         .build(tauri::generate_context!())

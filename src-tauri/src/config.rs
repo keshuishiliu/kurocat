@@ -98,6 +98,57 @@ fn default_sync_retain_days() -> u32 {
     15
 }
 
+// ---- 数据备份（WebDAV 快照，默认关闭） ----
+
+fn default_backup_enabled() -> bool {
+    false
+}
+
+fn default_backup_interval() -> u32 {
+    30
+}
+
+fn default_backup_retention() -> u32 {
+    15
+}
+
+/// 备份间隔：5 分钟起步（快照含整库导出 + 上传，太密对网盘和磁盘都不友好），
+/// 1440 上限（超过一天就失去「恢复到最近」的意义）。
+pub fn normalize_backup_interval(raw: u32) -> u32 {
+    raw.clamp(5, 1440)
+}
+
+/// 备份保留天数：1–365。过期快照在上传后由本机顺手清理（只删自己名下）。
+pub fn normalize_backup_retention(raw: u32) -> u32 {
+    raw.clamp(1, 365)
+}
+
+/// 数据备份设置。备份走同步的同一套 WebDAV 账号，这里只管
+/// 「要不要备、多久备一次、云端留多久」。仅上传，不自动下载；
+/// 「恢复到某个时间点」是唯一读取入口，必须由用户手动触发。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupSettings {
+    #[serde(default = "default_backup_enabled")]
+    pub enabled: bool,
+    /// 自动备份周期（分钟）。
+    #[serde(default = "default_backup_interval")]
+    pub interval_minutes: u32,
+    /// 云端快照保留天数。
+    #[serde(default = "default_backup_retention")]
+    pub retention_days: u32,
+}
+
+impl Default for BackupSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_backup_enabled(),
+            interval_minutes: default_backup_interval(),
+            retention_days: default_backup_retention(),
+        }
+    }
+}
+
 impl Default for SyncSettings {
     fn default() -> Self {
         Self {
@@ -528,6 +579,12 @@ pub struct AppSettings {
     /// 鼠标轨迹采样。默认关闭；关闭时不落盘，开启后才建 trail.db。
     #[serde(default)]
     pub input_log_trail_recording: bool,
+    /// 录入设置区门禁密码的 PBKDF2 哈希。`None` = 尚未设置。
+    /// 只由 input_log_password_* 命令写；其他任何设置入口必须原样保留
+    /// （宠物窗口的 update_settings 快照是旧值，覆盖回去等于密码被偷走）。
+    /// 此哈希永不参与库加解密——库密钥在系统凭据库里，两者彻底分离。
+    #[serde(default)]
+    pub input_log_password_hash: Option<String>,
     // ---- 数据同步（只由统计窗口的 sync_configure 写入） ----
     #[serde(default)]
     pub sync: SyncSettings,
@@ -554,6 +611,9 @@ pub struct AppSettings {
     pub fps_cap: u16,
     #[serde(default = "default_language")]
     pub language: String,
+    /// 数据备份（WebDAV 快照）。复用 sync 的账号，但独立开关。
+    #[serde(default)]
+    pub backup: BackupSettings,
 }
 
 impl Default for AppSettings {
@@ -587,7 +647,9 @@ impl Default for AppSettings {
             input_log_retention_days: 0,
             input_log_paused: false,
             input_log_trail_recording: false,
+            input_log_password_hash: None,
             sync: SyncSettings::default(),
+            backup: BackupSettings::default(),
             categories: default_categories(),
             app_categories: std::collections::BTreeMap::new(),
             app_display_names: std::collections::BTreeMap::new(),
@@ -782,6 +844,9 @@ pub fn load_settings() -> AppSettings {
             parsed.input_log_retention_days =
                 normalize_input_log_retention(parsed.input_log_retention_days);
             parsed.sync = normalize_sync_settings(parsed.sync);
+            parsed.backup.interval_minutes =
+                normalize_backup_interval(parsed.backup.interval_minutes);
+            parsed.backup.retention_days = normalize_backup_retention(parsed.backup.retention_days);
             parsed.categories = normalize_categories(&parsed.categories);
             parsed.app_categories = normalize_app_categories(&parsed.app_categories, &parsed.categories);
             parsed.app_display_names = normalize_app_display_names(&parsed.app_display_names);

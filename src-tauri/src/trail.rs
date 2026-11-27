@@ -20,7 +20,7 @@
 //! `push()` 在 hook dispatcher 线程被调用，只做节流 + 一次 `mpsc::send`，
 //! 所有 SQLite IO 都在 `kuro-input-trail` 线程里，绝不反压到输入链路。
 
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
@@ -207,7 +207,7 @@ pub fn prune_before(cutoff_ts: i64) {
     if !path.exists() {
         return;
     }
-    match Connection::open(&path) {
+    match crate::crypto::open_log_db(&path, "trail.db") {
         Ok(conn) => {
             let _ = conn.busy_timeout(Duration::from_millis(2000));
             if let Err(e) = conn.execute("DELETE FROM trail WHERE ts < ?1", params![cutoff_ts]) {
@@ -315,8 +315,7 @@ impl TrailRecorder {
 
     fn open_conn(&mut self) -> Result<(), String> {
         fs::create_dir_all(&self.dir).map_err(|e| format!("创建日志目录失败: {e}"))?;
-        let conn = Connection::open(self.dir.join("trail.db"))
-            .map_err(|e| format!("打开 trail.db 失败: {e}"))?;
+        let conn = crate::crypto::open_log_db(&self.dir.join("trail.db"), "trail.db")?;
         conn.busy_timeout(Duration::from_millis(3000))
             .map_err(|e| e.to_string())?;
         conn.execute_batch(
@@ -354,8 +353,7 @@ fn open_read() -> Result<Connection, String> {
     if !path.exists() {
         return Err("尚无轨迹记录".to_string());
     }
-    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-        .map_err(|e| format!("打开 trail.db 失败: {e}"))?;
+    let conn = crate::crypto::open_log_db(&path, "trail.db")?;
     conn.busy_timeout(Duration::from_millis(2000))
         .map_err(|e| e.to_string())?;
     Ok(conn)

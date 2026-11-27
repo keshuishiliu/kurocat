@@ -332,6 +332,18 @@
 
             <div class="row">
               <div class="row-main">
+                <div class="row-title">访问密码</div>
+                <div class="row-desc" id="pw-desc">
+                  开启记录前必须设置。进设置、查数据、导出、清空前都要先解锁，本次程序运行内输入一次即可。
+                </div>
+              </div>
+              <div class="row-ctl">
+                <button class="btn" id="pw-manage" type="button">设置密码</button>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-main">
                 <div class="row-title">临时暂停</div>
                 <div class="row-desc">只暂停写入，不改动开关状态。适合演示或录屏时临时用。</div>
               </div>
@@ -594,8 +606,131 @@
               </div>
             </div>
           </div>
+
+          <!-- 卡片 F：数据备份 -->
+          <div class="settings-card">
+            <div class="settings-card-head">
+              <div class="settings-card-title">数据备份</div>
+              <div class="settings-card-desc">
+                把录入数据库整体快照到网盘，误删或换机后可恢复到某个时间点。
+                复用「数据同步」的网盘账号，但只上传不合并——同步与备份各管各的。<br />
+                快照文件是加密库，配合网盘应用密码双重保护；备份设置与恢复入口都受录入密码保护。
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">自动备份</div>
+                <div class="row-desc">
+                  开启后按周期把数据库快照上传网盘。需要先配置好「数据同步」的账号。
+                </div>
+              </div>
+              <div class="row-ctl">
+                <label class="switch">
+                  <input type="checkbox" id="sw-backup" />
+                  <span class="switch-track"></span>
+                </label>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">备份间隔</div>
+                <div class="row-desc">多久自动备份一次。快照是整库导出，间隔不宜太短。</div>
+              </div>
+              <div class="row-ctl">
+                <select id="select-backup-interval">
+                  <option value="15">15 分钟</option>
+                  <option value="30" selected>30 分钟</option>
+                  <option value="60">1 小时</option>
+                  <option value="120">2 小时</option>
+                  <option value="360">6 小时</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">快照保留天数</div>
+                <div class="row-desc">
+                  网盘上的快照保留多久后自动清理（默认 15 天）。过了保留期的
+                  时间点就恢复不回去了，重要阶段可调大。
+                </div>
+              </div>
+              <div class="row-ctl">
+                <input type="number" id="input-backup-retain" min="1" max="365" style="width: 90px" />
+                <span class="row-desc" style="margin-left: 6px">天</span>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">操作</div>
+                <div class="row-desc">
+                  「立即备份」手动传一份快照；「恢复」列出网盘上的历史时间点，选一个整库还原。
+                </div>
+              </div>
+              <div class="row-ctl" style="flex-wrap: wrap; justify-content: flex-end">
+                <button class="btn" id="btn-backup-now" type="button">立即备份</button>
+                <button class="btn" id="btn-backup-list" type="button">恢复…</button>
+                <button class="btn" id="btn-backup-save" type="button">保存</button>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="row-main">
+                <div class="row-title">备份状态</div>
+                <div class="row-desc" id="backup-status">尚未备份</div>
+              </div>
+              <div class="row-ctl">
+                <span class="status-val mono" id="backup-last">—</span>
+              </div>
+            </div>
+          </div>
         </section>
       </main>
+    </div>
+
+    <!-- 录入访问密码：设置 / 解锁 / 修改 / 重置 -->
+    <div class="modal-mask" id="pw-modal">
+      <div class="modal">
+        <h3 id="pw-title">设置访问密码</h3>
+        <p id="pw-hint">—</p>
+        <div class="pw-field" id="pw-row-old" hidden>
+          <input type="password" id="input-pw-old" placeholder="原密码" autocomplete="off" />
+        </div>
+        <div class="pw-field" id="pw-row-new" hidden>
+          <input type="password" id="input-pw-new" placeholder="密码（至少 4 位）" autocomplete="off" />
+        </div>
+        <div class="pw-field" id="pw-row-confirm" hidden>
+          <input type="password" id="input-pw-confirm" placeholder="再输一遍确认" autocomplete="off" />
+        </div>
+        <p class="modal-danger" id="pw-error" hidden></p>
+        <div class="modal-actions">
+          <button class="btn" id="pw-cancel" type="button">取消</button>
+          <button class="btn link" id="pw-forgot" type="button" hidden>忘记密码？</button>
+          <button class="btn primary" id="pw-ok" type="button">确定</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 恢复到时间点：快照列表 + 二次确认 -->
+    <div class="modal-mask" id="restore-modal">
+      <div class="modal">
+        <h3>恢复到某个时间点</h3>
+        <p id="restore-hint">选择网盘上的一个快照，整库还原到那个时刻。</p>
+        <div id="restore-list" class="restore-list">
+          <div class="restore-empty" id="restore-empty">尚未备份</div>
+        </div>
+        <p class="modal-danger" id="restore-confirm" hidden>
+          ⚠️ 恢复会<b>整库替换</b>当前数据：快照之后录入的所有统计都会被覆盖
+          （恢复前的数据会保留在本地防呆目录）。确定继续吗？
+        </p>
+        <div class="modal-actions">
+          <button class="btn" id="restore-cancel" type="button">取消</button>
+          <button class="btn primary" id="restore-ok" type="button" disabled>恢复</button>
+        </div>
+      </div>
     </div>
 
     <!-- 首次开启的告知 -->

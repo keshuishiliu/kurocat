@@ -21,7 +21,7 @@
 //! 猫咪动画完全不受影响：`input_hook` 照旧把移动与滚轮 `emit` 给前端。
 
 use chrono::{Datelike, Local, TimeZone, Timelike};
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
@@ -130,6 +130,18 @@ CREATE TABLE IF NOT EXISTS merge_state (
     applied   INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (source_id, gkey)
 ) WITHOUT ROWID;
+
+-- ---------------------------------------------------------------------------
+-- 应用图标缓存（appmeta.rs 写，sync.rs 导入时补缺）。展示性数据，放 meta.db
+-- 而不是日志库：保留期清理、清空日志都不应影响图标。
+-- appmeta 现查成功（程序在跑 / 注册表可解析）就整行刷新——「打开程序时更新图标」；
+-- 现查失败回查这张表兜底——「否则就用旧图标」。同步导入的图标只补缺，本机已有
+-- 的一律不动（与 app_display_names 同一套合并纪律）。
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS app_icons (
+    process TEXT PRIMARY KEY,
+    icon    TEXT NOT NULL
+) WITHOUT ROWID;
 "#;
 
 // ---------------------------------------------------------------------------
@@ -153,6 +165,13 @@ enum Msg {
     Flush,
     /// 关闭连接 → 删除整个日志目录 → 重新打开。
     Wipe { reply: Sender<Result<(), String>> },
+    /// 关闭连接 → 现有库挪进防呆备份目录 → 换入快照库 → 重新打开。
+    /// staging 里放的是已验证、已改密到本机密钥的 events.db / meta.db。
+    Restore {
+        staging: PathBuf,
+        ts: i64,
+        reply: Sender<Result<Vec<String>, String>>,
+    },
     /// 在 recorder 线程执行保留期清理，避免与写入抢锁。
     Retention {
         days: u32,
@@ -434,7 +453,8 @@ impl Recorder {
     }
 
     fn open_events(path: &Path) -> Result<Connection, String> {
-        let conn = Connection::open(path).map_err(|e| format!("打开 events.db 失败: {e}"))?;
+        // SQLCipher 整库加密：密钥由 crypto 层保管，明文旧库在这里自动迁移。
+        let conn = crate::crypto::open_log_db(path, "events.db")?;
         conn.busy_timeout(Duration::from_millis(3000))
             .map_err(|e| e.to_string())?;
         conn.execute_batch(
@@ -448,7 +468,7 @@ impl Recorder {
     }
 
     fn open_meta(path: &Path) -> Result<Connection, String> {
-        let conn = Connection::open(path).map_err(|e| format!("打开 meta.db 失败: {e}"))?;
+        let conn = crate::crypto::open_log_db(path, "meta.db")?;
         conn.busy_timeout(Duration::from_millis(3000))
             .map_err(|e| e.to_string())?;
         conn.execute_batch(
@@ -494,6 +514,10 @@ impl Recorder {
                 }
                 Ok(Msg::Wipe { reply }) => {
                     let result = self.wipe();
+                    let _ = reply.send(result);
+                }
+                Ok(Msg::Restore { staging, ts, reply }) => {
+                    let result = self.restore_from(&staging, ts);
                     let _ = reply.send(result);
                 }
                 Ok(Msg::Retention { days, reply }) => {
@@ -943,6 +967,73 @@ impl Recorder {
         result
     }
 
+    /// 恢复：把 staging 里的快照库换进来，现有数据先挪进防呆目录。
+    /// 返回实际恢复的库文件名列表。
+    fn restore_from(&mut self, staging: &Path, ts: i64) -> Result<Vec<String>, String> {
+        // 1. 内存里的待写数据先落进旧库（虽然旧库马上要被换掉，但落盘动作
+        //    能保证 WAL 一致，挪动文件才不出幺蛾子）
+        self.flush_force();
+        let was_recording = RECORDING.swap(false, Ordering::SeqCst);
+        // 2. 换下旧连接（Windows 上被占用的文件不能改名/覆盖）
+        let placeholder = Connection::open_in_memory().map_err(|e| e.to_string())?;
+        let old_events = std::mem::replace(&mut self.events, placeholder);
+        let old_meta = std::mem::replace(
+            &mut self.meta,
+            Connection::open_in_memory().map_err(|e| e.to_string())?,
+        );
+        drop(old_events);
+        drop(old_meta);
+        // 3. 状态复位（与 wipe 一致，缺一不可）
+        self.buf.clear();
+        self.pending = Accum::default();
+        self.last_ts_by_app.clear();
+        self.privacy_ranges.clear();
+        self.privacy_open = false;
+        self.app_cache = None;
+        self.focus_last_ts = None;
+        self.focus_last_app = -1;
+        self.focus_carry_ms = 0;
+        // 4. 现有库挪进防呆目录（不删——恢复错了还有后悔药）
+        let rollback = self.dir.join(format!("pre-restore-{ts}"));
+        fs::create_dir_all(&rollback).map_err(|e| format!("创建防呆目录失败: {e}"))?;
+        let mut restored = Vec::new();
+        let move_result = (|| -> Result<(), String> {
+            for name in ["events.db", "meta.db"] {
+                let base = self.dir.join(name);
+                if base.exists() {
+                    fs::rename(&base, rollback.join(name))
+                        .map_err(|e| format!("备份现有 {name} 失败: {e}"))?;
+                }
+                for suffix in ["-wal", "-shm"] {
+                    let s = format!("{name}{suffix}");
+                    let src = self.dir.join(&s);
+                    if src.exists() {
+                        let _ = fs::rename(&src, rollback.join(&s));
+                    }
+                }
+            }
+            // 5. 换入快照库
+            for name in ["events.db", "meta.db"] {
+                let src = staging.join(name);
+                if src.exists() {
+                    fs::copy(&src, self.dir.join(name))
+                        .map_err(|e| format!("写入 {name} 失败: {e}"))?;
+                    restored.push(name.to_string());
+                }
+            }
+            Ok(())
+        })();
+        // 6. 无论成败都要把连接恢复出来，否则记录功能彻底停摆
+        self.events = Self::open_events(&events_db_path())?;
+        self.meta = Self::open_meta(&meta_db_path())?;
+        RECORDING.store(was_recording, Ordering::SeqCst);
+        move_result?;
+        if restored.is_empty() {
+            return Err("快照里没有可恢复的库".to_string());
+        }
+        Ok(restored)
+    }
+
     fn apply_retention(&mut self, days: u32) -> Result<RetentionReport, String> {
         if days == 0 {
             return Ok(RetentionReport::default());
@@ -1172,8 +1263,7 @@ fn open_meta_readonly() -> Result<Connection, String> {
     if !path.exists() {
         return Err("尚无记录".to_string());
     }
-    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-        .map_err(|e| format!("打开 meta.db 失败: {e}"))?;
+    let conn = crate::crypto::open_log_db(&path, "meta.db")?;
     conn.busy_timeout(Duration::from_millis(2000))
         .map_err(|e| e.to_string())?;
     Ok(conn)
@@ -1278,10 +1368,7 @@ pub fn status(
             .unwrap_or(0);
     }
 
-    if let Ok(conn) = Connection::open_with_flags(
-        events_db_path(),
-        OpenFlags::SQLITE_OPEN_READ_WRITE,
-    ) {
+    if let Ok(conn) = crate::crypto::open_log_db(&events_db_path(), "events.db") {
         if let Ok(months) = list_event_months(&conn) {
             st.month_tables = months.len();
         }
@@ -1607,8 +1694,7 @@ pub fn category_summary(
         let end_ms = local_midnight_ms(&end_day);
         let ev_path = events_db_path();
         if ev_path.exists() {
-            let ev = Connection::open_with_flags(&ev_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-                .map_err(|e| format!("打开 events.db 失败: {e}"))?;
+            let ev = crate::crypto::open_log_db(&ev_path, "events.db")?;
             ev.busy_timeout(Duration::from_millis(2000))
                 .map_err(|e| e.to_string())?;
             let mut hour_agg: HashMap<(i64, String), i64> = HashMap::new();
@@ -2038,8 +2124,7 @@ pub fn retention_preview(days: u32) -> Result<RetentionPreview, String> {
     if !events_db_path().exists() {
         return Ok(preview);
     }
-    let conn = Connection::open_with_flags(&events_db_path(), OpenFlags::SQLITE_OPEN_READ_WRITE)
-        .map_err(|e| e.to_string())?;
+    let conn = crate::crypto::open_log_db(&events_db_path(), "events.db")?;
     let cutoff_month = month_of(cutoff_ts);
     for month in list_event_months(&conn)? {
         let table = month_table_name(&month);
@@ -2089,6 +2174,51 @@ pub fn wipe_all() -> Result<(), String> {
         .map_err(|e| format!("清空超时: {e}"))?
 }
 
+/// 恢复快照库。recorder 线程内执行（连接由它持有）。
+/// recorder 从未启动时兜底：直接在文件系统层替换（没有连接要收）。
+pub fn restore_from(staging: &Path, ts: i64) -> Result<Vec<String>, String> {
+    let Some(sender) = TX.get() else {
+        let dir = log_dir();
+        fs::create_dir_all(&dir).map_err(|e| format!("创建日志目录失败: {e}"))?;
+        let rollback = dir.join(format!("pre-restore-{ts}"));
+        fs::create_dir_all(&rollback).map_err(|e| format!("创建防呆目录失败: {e}"))?;
+        let mut restored = Vec::new();
+        for name in ["events.db", "meta.db"] {
+            let base = dir.join(name);
+            if base.exists() {
+                fs::rename(&base, rollback.join(name))
+                    .map_err(|e| format!("备份现有 {name} 失败: {e}"))?;
+            }
+            for suffix in ["-wal", "-shm"] {
+                let s = format!("{name}{suffix}");
+                let src = dir.join(&s);
+                if src.exists() {
+                    let _ = fs::rename(&src, rollback.join(&s));
+                }
+            }
+            let src = staging.join(name);
+            if src.exists() {
+                fs::copy(&src, dir.join(name)).map_err(|e| format!("写入 {name} 失败: {e}"))?;
+                restored.push(name.to_string());
+            }
+        }
+        if restored.is_empty() {
+            return Err("快照里没有可恢复的库".to_string());
+        }
+        return Ok(restored);
+    };
+    let (tx, rx) = mpsc::channel();
+    sender
+        .send(Msg::Restore {
+            staging: staging.to_path_buf(),
+            ts,
+            reply: tx,
+        })
+        .map_err(|e| e.to_string())?;
+    rx.recv_timeout(Duration::from_secs(120))
+        .map_err(|e| format!("恢复超时: {e}"))?
+}
+
 // ---------------------------------------------------------------------------
 // CSV 导出（流式，不在内存里堆积）
 // ---------------------------------------------------------------------------
@@ -2098,12 +2228,13 @@ pub fn export_csv(from_ts: i64, to_ts: i64, out: &Path) -> Result<i64, String> {
     if !events_db_path().exists() {
         return Err("尚无记录可导出".to_string());
     }
-    let conn = Connection::open_with_flags(&events_db_path(), OpenFlags::SQLITE_OPEN_READ_WRITE)
-        .map_err(|e| e.to_string())?;
+    let conn = crate::crypto::open_log_db(&events_db_path(), "events.db")?;
     let meta = meta_db_path();
     if meta.exists() {
+        // meta.db 同为加密库，ATTACH 必须带上库密钥
+        let key = crate::crypto::db_key_hex()?;
         let _ = conn.execute(
-            "ATTACH DATABASE ?1 AS meta",
+            &format!("ATTACH DATABASE ?1 AS meta KEY \"x'{key}'\""),
             params![meta.to_string_lossy().to_string()],
         );
     }

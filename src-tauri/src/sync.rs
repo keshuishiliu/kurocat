@@ -53,7 +53,7 @@
 use crate::config::{normalize_app_categories, normalize_categories, AppSettings, SyncSettings};
 use crate::recorder;
 use chrono::NaiveDate;
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use std::collections::HashMap;
@@ -68,7 +68,7 @@ use tauri::{AppHandle, Emitter};
 // ---------------------------------------------------------------------------
 
 /// WebDAV 上的根目录名。所有机器共用，子目录按 machine_id 隔离。
-const DAV_ROOT: &str = "KuroCatSync";
+pub(crate) const DAV_ROOT: &str = "KuroCatSync";
 /// 合并包格式版本。结构不兼容时递增，旧包导入时按 format 拒绝。
 /// 合并包格式版本。
 ///
@@ -98,6 +98,10 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 struct PackApp {
     id: i64,
     process: String,
+    /// 导出方解析出的应用图标（48×48 ICO 的 base64 data URL）。
+    /// v5.5.1 起随包携带；旧包无此字段 → None。解析失败的也不带。
+    #[serde(default)]
+    icon: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -116,6 +120,10 @@ struct PackTrail {
     ts: i64,
     x: i32,
     y: i32,
+    /// 采样时前台应用所属的分类 id（v5.3.0 起随包携带；旧包无此字段 → None）。
+    /// 分类配置随包合并（id 两机一致），导入后回放即可按对方当时的分类着色。
+    #[serde(default)]
+    cat: Option<String>,
 }
 
 /// daily_stats 一行：按键/点击按天计数。
@@ -169,8 +177,9 @@ struct PackRowFocus {
 /// 汇总表带的是**全量值**而不是差值：差值在导入侧按 `merge_state` 现算。
 /// 这样丢包可以自愈——任何更新的包都携带完整现状，不依赖「每个包依次到达」。
 ///
-/// `app_display_names` / `app_ignored` 是后加的字段（`serde(default)`）：旧版本
-/// 收到新包会忽略未知字段，新版本收到旧包用空列表，双向兼容，不递增 PACK_FORMAT。
+/// `app_display_names` / `app_ignored` / 轨迹的 `cat` / 应用的 `icon` 是后加的字段
+/// （`serde(default)`）：旧版本收到新包会忽略未知字段，新版本收到旧包用空值，
+/// 双向兼容，不递增 PACK_FORMAT。
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct MergePack {
     format: u32,
@@ -306,6 +315,17 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// 当前机器的 machine_id（meta.db 的 sync_state）。备份模块用。
+/// meta.db 不存在说明从未有过数据，返回 None（也就没有可备份的东西）。
+pub(crate) fn current_machine_id() -> Result<Option<String>, String> {
+    let path = recorder::log_dir().join("meta.db");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = crate::crypto::open_log_db(&path, "meta.db")?;
+    Ok(Some(ensure_machine_id(&conn)))
+}
+
 /// "YYYY-MM-DD" 的前一天。解析失败原样返回（宁可多导一天，不能漏）。
 fn day_before(day: &str) -> String {
     match NaiveDate::parse_from_str(day, "%Y-%m-%d") {
@@ -322,10 +342,9 @@ fn day_before(day: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn open_meta() -> Result<Connection, String> {
-    let dir = recorder::log_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建日志目录失败: {e}"))?;
+    // SQLCipher 加密打开（新库直接加密，明文旧库自动迁移）
     let conn =
-        Connection::open(dir.join("meta.db")).map_err(|e| format!("打开 meta.db 失败: {e}"))?;
+        crate::crypto::open_log_db(&recorder::log_dir().join("meta.db"), "meta.db")?;
     conn.busy_timeout(Duration::from_millis(3000))
         .map_err(|e| e.to_string())?;
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
@@ -371,7 +390,7 @@ fn open_meta_existing() -> Option<Connection> {
     if !path.exists() {
         return None;
     }
-    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE).ok()?;
+    let conn = crate::crypto::open_log_db(&path, "meta.db").ok()?;
     conn.busy_timeout(Duration::from_millis(2000)).ok()?;
     Some(conn)
 }
@@ -381,16 +400,13 @@ fn open_events_read() -> Option<Connection> {
     if !path.exists() {
         return None;
     }
-    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE).ok()?;
+    let conn = crate::crypto::open_log_db(&path, "events.db").ok()?;
     conn.busy_timeout(Duration::from_millis(3000)).ok()?;
     Some(conn)
 }
 
 fn open_events_write() -> Result<Connection, String> {
-    let dir = recorder::log_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建日志目录失败: {e}"))?;
-    let conn = Connection::open(dir.join("events.db"))
-        .map_err(|e| format!("打开 events.db 失败: {e}"))?;
+    let conn = crate::crypto::open_log_db(&recorder::log_dir().join("events.db"), "events.db")?;
     conn.busy_timeout(Duration::from_millis(3000))
         .map_err(|e| e.to_string())?;
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
@@ -403,26 +419,24 @@ fn open_trail_read() -> Option<Connection> {
     if !path.exists() {
         return None;
     }
-    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE).ok()?;
+    let conn = crate::crypto::open_log_db(&path, "trail.db").ok()?;
     conn.busy_timeout(Duration::from_millis(3000)).ok()?;
     Some(conn)
 }
 
 /// 打开（必要时创建）trail.db。只有导入轨迹时才调用。
 fn open_trail_write() -> Result<Connection, String> {
-    let dir = recorder::log_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建日志目录失败: {e}"))?;
-    let conn =
-        Connection::open(dir.join("trail.db")).map_err(|e| format!("打开 trail.db 失败: {e}"))?;
+    let conn = crate::crypto::open_log_db(&recorder::log_dir().join("trail.db"), "trail.db")?;
     conn.busy_timeout(Duration::from_millis(3000))
         .map_err(|e| e.to_string())?;
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
          CREATE TABLE IF NOT EXISTS trail (
-             ts INTEGER NOT NULL,
-             x  INTEGER NOT NULL,
-             y  INTEGER NOT NULL
+             ts  INTEGER NOT NULL,
+             x   INTEGER NOT NULL,
+             y   INTEGER NOT NULL,
+             cat TEXT
          );
          CREATE INDEX IF NOT EXISTS idx_trail_ts ON trail(ts);",
     )
@@ -434,37 +448,40 @@ fn open_trail_write() -> Result<Connection, String> {
 // src 列：回声抑制的物理基础
 // ---------------------------------------------------------------------------
 
-/// 给表补 `src TEXT` 列（已存在则跳过）。老库升级第一条路径。
-fn ensure_src_column(conn: &Connection, table: &str) -> Result<(), String> {
-    let has_src: bool = conn
+/// 给表补一列（已存在则跳过）。老库升级的通用路径。
+fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<(), String> {
+    let has_col: bool = conn
         .prepare(&format!("PRAGMA table_info({table})"))
         .and_then(|mut stmt| {
             stmt.query_map([], |r| r.get::<_, String>(1))
-                .map(|rows| {
-                    rows.flatten().any(|name| name.eq_ignore_ascii_case("src"))
-                })
+                .map(|rows| rows.flatten().any(|name| name.eq_ignore_ascii_case(column)))
         })
         .map_err(|e| format!("检查 {table} 表结构失败: {e}"))?;
-    if !has_src {
+    if !has_col {
         conn.execute_batch(&format!(
-            "ALTER TABLE {table} ADD COLUMN src TEXT;"
+            "ALTER TABLE {table} ADD COLUMN {column} {decl};"
         ))
-        .map_err(|e| format!("{table} 补 src 列失败: {e}"))?;
+        .map_err(|e| format!("{table} 补 {column} 列失败: {e}"))?;
     }
     Ok(())
+}
+
+/// 给表补 `src TEXT` 列（已存在则跳过）。老库升级第一条路径。
+fn ensure_src_column(conn: &Connection, table: &str) -> Result<(), String> {
+    ensure_column(conn, table, "src", "TEXT")
 }
 
 // ---------------------------------------------------------------------------
 // WebDAV 客户端
 // ---------------------------------------------------------------------------
 
-struct DavEntry {
+pub(crate) struct DavEntry {
     /// 解码后的名字（目录不带尾斜杠）。
-    name: String,
-    is_dir: bool,
+    pub(crate) name: String,
+    pub(crate) is_dir: bool,
 }
 
-struct Dav {
+pub(crate) struct Dav {
     client: reqwest::blocking::Client,
     /// 无尾斜杠的 WebDAV 基址，例如 `https://dav.jianguoyun.com/dav`。
     base: String,
@@ -473,7 +490,7 @@ struct Dav {
 }
 
 impl Dav {
-    fn new(cfg: &SyncSettings) -> Result<Dav, String> {
+    pub(crate) fn new(cfg: &SyncSettings) -> Result<Dav, String> {
         let base = cfg.server.trim().trim_end_matches('/').to_string();
         if base.is_empty() {
             return Err("服务器地址为空".to_string());
@@ -502,7 +519,7 @@ impl Dav {
     }
 
     /// MKCOL 建目录。405（已存在）视为成功。
-    fn ensure_dir(&self, path: &str) -> Result<(), String> {
+    pub(crate) fn ensure_dir(&self, path: &str) -> Result<(), String> {
         let method =
             reqwest::Method::from_bytes(b"MKCOL").map_err(|e| e.to_string())?;
         let resp = self.req(method, path).send().map_err(|e| e.to_string())?;
@@ -514,7 +531,7 @@ impl Dav {
         }
     }
 
-    fn put(&self, path: &str, body: Vec<u8>) -> Result<(), String> {
+    pub(crate) fn put(&self, path: &str, body: Vec<u8>) -> Result<(), String> {
         let resp = self
             .req(reqwest::Method::PUT, path)
             .body(body)
@@ -530,7 +547,7 @@ impl Dav {
         }
     }
 
-    fn get(&self, path: &str) -> Result<Vec<u8>, String> {
+    pub(crate) fn get(&self, path: &str) -> Result<Vec<u8>, String> {
         let resp = self
             .req(reqwest::Method::GET, path)
             .send()
@@ -547,7 +564,7 @@ impl Dav {
             .map_err(|e| format!("读取 {path} 失败: {e}"))
     }
 
-    fn delete(&self, path: &str) -> Result<(), String> {
+    pub(crate) fn delete(&self, path: &str) -> Result<(), String> {
         let resp = self
             .req(reqwest::Method::DELETE, path)
             .send()
@@ -561,7 +578,7 @@ impl Dav {
     }
 
     /// PROPFIND Depth:1 列目录。404（还没建）返回空列表。
-    fn list(&self, path: &str) -> Result<Vec<DavEntry>, String> {
+    pub(crate) fn list(&self, path: &str) -> Result<Vec<DavEntry>, String> {
         let propfind =
             reqwest::Method::from_bytes(b"PROPFIND").map_err(|e| e.to_string())?;
         let resp = self
@@ -774,11 +791,13 @@ fn build_pack(
         .map(|e| e.ts)
         .fold(ev_wm, i64::max);
 
-    // ---- 轨迹采样（同样只带本机记录的行） ----
+    // ---- 轨迹采样（同样只带本机记录的行；v5.3.0 起随包携带分类 id） ----
     if let Some(conn) = open_trail_read() {
         ensure_src_column(&conn, "trail")?;
+        // 老库可能还没有 cat 列（trail.rs 打开时才补），导出前先补上
+        ensure_column(&conn, "trail", "cat", "TEXT")?;
         let mut stmt = conn
-            .prepare("SELECT ts, x, y FROM trail WHERE ts > ?1 AND src IS NULL ORDER BY ts LIMIT ?2")
+            .prepare("SELECT ts, x, y, cat FROM trail WHERE ts > ?1 AND src IS NULL ORDER BY ts LIMIT ?2")
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(params![tr_wm, PACK_MAX_TRAIL as i64], |r| {
@@ -786,6 +805,7 @@ fn build_pack(
                     ts: r.get(0)?,
                     x: r.get(1)?,
                     y: r.get(2)?,
+                    cat: r.get(3)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -795,7 +815,7 @@ fn build_pack(
         pack.export_trail_ts = pack.trail.iter().map(|t| t.ts).fold(tr_wm, i64::max);
     }
 
-    // ---- apps 表全量（导入侧按 process 映射） ----
+    // ---- apps 表全量（导入侧按 process 映射）；v5.5.1 起随包携带本机解析出的图标 ----
     {
         let mut stmt = meta
             .prepare("SELECT id, process FROM apps ORDER BY id")
@@ -805,10 +825,23 @@ fn build_pack(
                 Ok(PackApp {
                     id: r.get(0)?,
                     process: r.get(1)?,
+                    icon: None,
                 })
             })
             .map_err(|e| e.to_string())?;
         pack.apps = rows.flatten().collect();
+        // 图标现查：进程枚举 + 注册表 + 资源抽取，最贵一步。同步本来就在阻塞线程里
+        // 跑，且 resolve_many 有进程内缓存，只有首次导出真正抽取。解析失败的
+        // 不带——对方自己现查 / 用它本地的缓存兜底。macOS/Linux 侧 resolve
+        // 全空，照旧不带，包体积零增长。
+        let processes: Vec<String> = pack.apps.iter().map(|a| a.process.clone()).collect();
+        let icon_by_process: HashMap<String, String> = crate::appmeta::resolve_many(processes)
+            .into_iter()
+            .filter_map(|m| m.icon.map(|i| (m.process, i)))
+            .collect();
+        for app in &mut pack.apps {
+            app.icon = icon_by_process.get(&app.process).cloned();
+        }
     }
 
     // ---- 汇总表（重叠窗口内全量值） ----
@@ -1127,6 +1160,31 @@ fn import_pack(
         }
     }
 
+    // ---- 1.5 图标缓存：只补缺，本机已有的一律不动 ----
+    //
+    // 本机已有的图标要么来自自己的现查（最准），要么是更早导入的；对方的
+    // 图标只用来填「本机没装这个软件」的空。appmeta 现查成功会整行刷新，
+    // 所以这里绝不覆盖——不然对方软件升了级，会把本机的新图标顶成旧的。
+    if pack.apps.iter().any(|a| a.icon.is_some()) {
+        meta.execute_batch(
+            "CREATE TABLE IF NOT EXISTS app_icons (
+                 process TEXT PRIMARY KEY,
+                 icon    TEXT NOT NULL
+             ) WITHOUT ROWID;",
+        )
+        .map_err(|e| format!("建 app_icons 表失败: {e}"))?;
+        for app in &pack.apps {
+            if let Some(icon) = &app.icon {
+                meta.execute(
+                    "INSERT INTO app_icons(process, icon) VALUES(?1, ?2)
+                     ON CONFLICT(process) DO NOTHING",
+                    params![app.process, icon],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+
     // ---- 2. 事件明细（ts > 水位线，按月表落库，打上 src 标记） ----
     {
         let wm = get_state_i64(meta, &format!("import_ev_ts|{src}"));
@@ -1166,16 +1224,17 @@ fn import_pack(
     if !pack.trail.is_empty() {
         let trail = trail.ok_or("轨迹库未就绪")?;
         ensure_src_column(trail, "trail")?;
+        ensure_column(trail, "trail", "cat", "TEXT")?;
         let wm = get_state_i64(meta, &format!("import_tr_ts|{src}"));
         let fresh: Vec<&PackTrail> = pack.trail.iter().filter(|t| t.ts > wm).collect();
         if !fresh.is_empty() {
             let tx = trail.unchecked_transaction().map_err(|e| e.to_string())?;
             {
                 let mut stmt = tx
-                    .prepare("INSERT INTO trail(ts, x, y, src) VALUES(?1, ?2, ?3, ?4)")
+                    .prepare("INSERT INTO trail(ts, x, y, cat, src) VALUES(?1, ?2, ?3, ?4, ?5)")
                     .map_err(|e| e.to_string())?;
                 for t in fresh {
-                    stmt.execute(params![t.ts, t.x, t.y, src])
+                    stmt.execute(params![t.ts, t.x, t.y, t.cat, src])
                         .map_err(|e| e.to_string())?;
                 }
             }
@@ -1415,7 +1474,25 @@ fn run_sync_once(
                     continue;
                 }
             };
-            let pack: MergePack = match serde_json::from_slice(&bytes) {
+            // 新版加密包 → 解密；旧版明文包（无信封头）→ 原样使用。
+            // 解密失败不登记 imported_packs：修好密码后下一轮还能重新导入。
+            let plain = {
+                let dav_password = settings
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .sync
+                    .password
+                    .clone();
+                match crate::crypto::try_decrypt_pack(&bytes, &dav_password) {
+                    Ok(Some(p)) => p,
+                    Ok(None) => bytes,
+                    Err(e) => {
+                        warnings.push(format!("解密 {} 失败: {e}", file.name));
+                        continue;
+                    }
+                }
+            };
+            let pack: MergePack = match serde_json::from_slice(&plain) {
                 Ok(p) => p,
                 Err(e) => {
                     // 解析失败的包登记成已处理：网盘传输是原子的，解析失败
@@ -1478,11 +1555,20 @@ fn export_once(
     let seq = get_state_i64(meta, "export_seq") + 1;
     let name = pack_name(pack.exported_at, seq, machine_id);
     let json = serde_json::to_vec(&pack).map_err(|e| format!("序列化合并包失败: {e}"))?;
+    // 同步包整包加密：密钥 = PBKDF2(WebDAV 密码)。两台机器同账户 ⇒ 同密码 ⇒ 互解。
+    // 输入历史由此不再以明文离开本机。
+    let dav_password = settings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .sync
+        .password
+        .clone();
+    let payload = crate::crypto::encrypt_pack(&json, &dav_password)?;
 
     dav.ensure_dir(DAV_ROOT)?;
     let own = format!("{DAV_ROOT}/{machine_id}");
     dav.ensure_dir(&own)?;
-    dav.put(&format!("{own}/{name}"), json)?;
+    dav.put(&format!("{own}/{name}"), payload)?;
 
     // 上传成功，推进全部水位线
     let today = recorder::day_hour_local(now_ms()).0;
@@ -1762,7 +1848,11 @@ mod tests {
         let mut p = MergePack::empty(machine_id);
         // 生产环境的包由 build_pack 填 export_ts；测试里手动对齐事件的最大 ts
         p.export_ts = 1_700_000_000_000;
-        p.apps = vec![PackApp { id: 5, process: "game.exe".to_string() }];
+        p.apps = vec![PackApp {
+            id: 5,
+            process: "game.exe".to_string(),
+            icon: None,
+        }];
         p.events = vec![PackEvent {
             ts: 1_700_000_000_000,
             kind: recorder::KIND_KEY_DOWN,
@@ -1781,14 +1871,132 @@ mod tests {
         p
     }
 
+    /// 带一个轨迹点（含分类 id）的包，轨迹用例专用。
+    fn sample_pack_with_trail(machine_id: &str) -> MergePack {
+        let mut p = sample_pack(machine_id);
+        p.trail = vec![PackTrail {
+            ts: 1_700_000_000_000,
+            x: 100,
+            y: 200,
+            cat: Some("work".to_string()),
+        }];
+        // 生产环境的包由 build_pack 填轨迹水位线；测试里对齐轨迹点的最大 ts
+        p.export_trail_ts = 1_700_000_000_000;
+        p
+    }
+
     #[test]
     fn pack_json_roundtrip() {
-        let p = sample_pack("abc123");
+        let p = sample_pack_with_trail("abc123");
         let bytes = serde_json::to_vec(&p).unwrap();
         let back: MergePack = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back.machine_id, "abc123");
         assert_eq!(back.events.len(), 1);
         assert_eq!(back.apps[0].process, "game.exe");
+        assert_eq!(back.trail[0].cat.as_deref(), Some("work"));
+    }
+
+    /// 旧版本（v5.2.x）的包里 trail 没有 cat 字段，反序列化必须落到 None。
+    #[test]
+    fn old_pack_trail_without_cat_deserializes() {
+        let json = br#"{
+            "format": 3, "machine_id": "old", "exported_at": 0,
+            "export_ts": 0, "export_trail_ts": 0,
+            "categories": [], "app_categories": [],
+            "apps": [{"id": 1, "process": "foo.exe"}],
+            "events": [], "trail": [{"ts": 100, "x": 1, "y": 2}],
+            "stats": [], "hours": [], "app_days": [], "app_keys": [], "focus": []
+        }"#;
+        let pack: MergePack = serde_json::from_slice(json).unwrap();
+        assert_eq!(pack.trail.len(), 1);
+        assert_eq!(pack.trail[0].cat, None);
+        assert_eq!(pack.apps.len(), 1);
+        assert_eq!(pack.apps[0].icon, None);
+    }
+
+    /// 导入的轨迹点必须带上包里的分类 id（回放着色的数据来源），且带 src 标记。
+    /// 用内存库模拟 open_trail_write 建出的表（含 cat 列）。
+    #[test]
+    fn trail_import_keeps_category() {
+        let meta = mem_meta();
+        let settings = Arc::new(Mutex::new(AppSettings::default()));
+        let trail = Connection::open_in_memory().unwrap();
+        trail
+            .execute_batch(
+                "CREATE TABLE trail (
+                     ts  INTEGER NOT NULL,
+                     x   INTEGER NOT NULL,
+                     y   INTEGER NOT NULL,
+                     cat TEXT
+                 );",
+            )
+            .unwrap();
+
+        let pack = sample_pack_with_trail("src1");
+        let events = Connection::open_in_memory().unwrap();
+        import_pack(&pack, "src1", "p1.json", &meta, Some(&events), Some(&trail), &settings)
+            .unwrap();
+
+        let (cat, src): (Option<String>, Option<String>) = trail
+            .query_row("SELECT cat, src FROM trail", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(cat.as_deref(), Some("work"));
+        assert_eq!(src.as_deref(), Some("src1"));
+
+        // 同一个包重导：幂等，不产生第二行
+        import_pack(&pack, "src1", "p1.json", &meta, Some(&events), Some(&trail), &settings)
+            .unwrap();
+        let n: i64 = trail.query_row("SELECT COUNT(*) FROM trail", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// 导入的图标只补缺：本机没有的进程采纳对方的；本机已有的绝不被覆盖。
+    #[test]
+    fn app_icon_import_fills_only_missing() {
+        let meta = mem_meta();
+        let settings = Arc::new(Mutex::new(AppSettings::default()));
+
+        let mut pack = sample_pack("src1");
+        pack.apps[0].icon = Some("data:image/x-icon;base64,OLD".to_string());
+        let events = Connection::open_in_memory().unwrap();
+        import_pack(&pack, "src1", "p1.json", &meta, Some(&events), None, &settings).unwrap();
+
+        let icon: String = meta
+            .query_row(
+                "SELECT icon FROM app_icons WHERE process = 'game.exe'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(icon, "data:image/x-icon;base64,OLD", "本机没有 → 采纳对方的");
+
+        // 对方软件升级换了图标：本机已有的一律不动
+        let mut pack2 = sample_pack("src1");
+        pack2.apps[0].icon = Some("data:image/x-icon;base64,NEW".to_string());
+        import_pack(&pack2, "src1", "p2.json", &meta, Some(&events), None, &settings).unwrap();
+        let icon: String = meta
+            .query_row(
+                "SELECT icon FROM app_icons WHERE process = 'game.exe'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(icon, "data:image/x-icon;base64,OLD", "本机已有的不能被覆盖");
+
+        // 全空 icon 的包不该建表报错，也不该动已有数据
+        let mut pack3 = sample_pack("src1");
+        pack3.apps[0].icon = None;
+        import_pack(&pack3, "src1", "p3.json", &meta, Some(&events), None, &settings).unwrap();
+        let icon: String = meta
+            .query_row(
+                "SELECT icon FROM app_icons WHERE process = 'game.exe'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(icon, "data:image/x-icon;base64,OLD");
     }
 
     #[test]

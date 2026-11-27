@@ -1358,11 +1358,85 @@ input[type="range"]:disabled {
   font-weight: 600;
 }
 
+/* 恢复弹窗：快照时间点列表 */
+.restore-list {
+  max-height: 240px;
+  overflow-y: auto;
+  border: 1px solid var(--line, rgba(0, 0, 0, 0.12));
+  border-radius: 8px;
+  margin: 12px 0;
+}
+
+.restore-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--line, rgba(0, 0, 0, 0.08));
+  font-size: 13px;
+}
+
+.restore-item:last-child {
+  border-bottom: none;
+}
+
+.restore-item:hover {
+  background: rgba(127, 127, 127, 0.08);
+}
+
+.restore-item.selected {
+  background: rgba(64, 158, 255, 0.14);
+}
+
+.restore-item .restore-files {
+  margin-left: auto;
+  font-size: 11px;
+  opacity: 0.65;
+}
+
+.restore-empty {
+  padding: 18px 12px;
+  text-align: center;
+  font-size: 13px;
+  opacity: 0.6;
+}
+
 .modal-actions {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
   margin-top: 20px;
+}
+
+/* 访问密码弹窗 */
+.pw-field {
+  margin: 10px 0;
+}
+
+.pw-field input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+}
+
+.pw-field input:focus {
+  border-color: var(--accent, #6c7bff);
+}
+
+.btn.link {
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  text-decoration: underline;
+  margin-right: auto;
+  cursor: pointer;
 }
 
 /* 分类表单 */

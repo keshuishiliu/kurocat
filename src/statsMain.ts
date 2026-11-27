@@ -60,6 +60,14 @@ interface LogStatus {
   trailEnabled: boolean;
 }
 
+/** 录入访问密码状态（input_log_password_status 的返回）。 */
+interface PasswordStatus {
+  /** 是否已设置密码。未设置时录制被门禁压制。 */
+  set: boolean;
+  /** 本次运行是否已解锁（重启后回到 false）。 */
+  unlocked: boolean;
+}
+
 interface SummaryPoint {
   label: string;
   keydown: number;
@@ -163,6 +171,36 @@ interface SyncOutcome {
   warnings: string[];
 }
 
+/** 备份配置（对应 config.rs 的 BackupSettings）。 */
+interface BackupConfig {
+  enabled: boolean;
+  intervalMinutes: number;
+  retentionDays: number;
+}
+
+/** 备份状态（对应 backup.rs 的 BackupStatus）。 */
+interface BackupStatusInfo {
+  enabled: boolean;
+  intervalMinutes: number;
+  retentionDays: number;
+  lastBackupTs: number;
+  lastOk: boolean;
+  lastMessage: string;
+}
+
+/** 云端快照（对应 backup.rs 的 SnapshotMeta）。 */
+interface SnapshotMeta {
+  ts: number;
+  name: string;
+  files: string[];
+}
+
+/** 一次恢复的结果（对应 backup.rs 的 RestoreReport）。 */
+interface RestoreReport {
+  restored: string[];
+  note: string;
+}
+
 interface TrailRangeInfo {
   firstTs: number | null;
   lastTs: number | null;
@@ -220,7 +258,7 @@ const DEMO_APP_META: Record<string, { name: string; version: string; path: strin
   },
   'kurocat.exe': {
     name: 'Kuro 猫猫宠',
-    version: '5.5.0',
+    version: '5.6.0',
     path: 'D:\\Programs\\kurocat\\KuroCat.exe',
   },
   'windowsterminal.exe': {
@@ -436,6 +474,13 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
   switch (cmd) {
     case 'input_log_stats':
       return demoStatus() as unknown as T;
+    case 'input_log_password_status':
+      return { set: true, unlocked: true } as unknown as T;
+    case 'input_log_password_set':
+    case 'input_log_password_verify':
+    case 'input_log_password_change':
+    case 'input_log_password_reset':
+      return { set: true, unlocked: true } as unknown as T;
     case 'input_log_configure':
     case 'input_log_set_trail':
       demoEnabled = Boolean(args?.enabled ?? demoEnabled);
@@ -476,6 +521,11 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
           machineLabel: '演示机',
           intervalMinutes: 30,
         },
+        backup: {
+          enabled: false,
+          intervalMinutes: 30,
+          retentionDays: 15,
+        },
       } as unknown as T;
     case 'sync_configure':
       return (args?.sync ?? {}) as unknown as T;
@@ -498,6 +548,33 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
         skipped: 5,
         categoriesMerged: false,
         warnings: [],
+      } as unknown as T;
+    case 'backup_status':
+      return {
+        enabled: false,
+        intervalMinutes: 30,
+        retentionDays: 15,
+        lastBackupTs: 0,
+        lastOk: false,
+        lastMessage: '尚未备份',
+      } as unknown as T;
+    case 'backup_configure':
+      return (args?.backup ?? {}) as unknown as T;
+    case 'backup_run_now':
+      return {
+        ts: Date.now(),
+        name: String(Date.now()),
+        files: ['events.db', 'meta.db'],
+      } as unknown as T;
+    case 'backup_list':
+      return [
+        { ts: Date.now() - 3_600_000, name: String(Date.now() - 3_600_000), files: ['events.db', 'meta.db', 'trail.db'] },
+        { ts: Date.now() - 86_400_000, name: String(Date.now() - 86_400_000), files: ['events.db', 'meta.db'] },
+      ] as unknown as T;
+    case 'backup_restore':
+      return {
+        restored: ['events.db', 'meta.db'],
+        note: '恢复前的数据已保留在 input-log/pre-restore 目录，确认无误后可自行删除。',
       } as unknown as T;
     default:
       throw new Error(`演示模式不支持 ${cmd}`);
@@ -625,8 +702,185 @@ async function guard<T>(task: () => Promise<T>): Promise<T | null> {
   try {
     return await task();
   } catch (err) {
-    toast(String(err));
+    const msg = String(err);
+    // 后端门禁：录入相关命令在未设密码/未解锁时统一返回 LOCKED: 前缀错误
+    if (msg.startsWith('LOCKED:')) {
+      void handleLocked(msg.slice('LOCKED:'.length));
+      return null;
+    }
+    toast(msg);
     return null;
+  }
+}
+
+// ---------------------------------------------------------------- 访问密码门禁
+
+let pwStatus: PasswordStatus | null = null;
+type PwMode = 'set' | 'unlock' | 'change' | 'reset';
+let pwMode: PwMode = 'unlock';
+/** 解锁/设密码成功后要继续的动作（比如「打开刚才想改的开关」）。 */
+let pwPending: (() => Promise<void>) | null = null;
+/** 阻塞态弹窗（解锁/强制设密码）不允许点遮罩或 Esc 关掉。 */
+let pwBlocking = false;
+
+const PW_FIELD_IDS = ['pw-row-old', 'pw-row-new', 'pw-row-confirm'] as const;
+
+async function refreshPwStatus(): Promise<PasswordStatus> {
+  pwStatus = await call<PasswordStatus>('input_log_password_status');
+  renderPwRow();
+  return pwStatus;
+}
+
+function renderPwRow(): void {
+  if (!pwStatus) return;
+  const btn = $('pw-manage');
+  const desc = $('pw-desc');
+  if (!pwStatus.set) {
+    btn.textContent = '设置密码';
+    desc.textContent = '尚未设置。开启记录前必须先设密码，用于保护本页的录入数据与设置。';
+  } else if (!pwStatus.unlocked) {
+    btn.textContent = '修改密码';
+    desc.textContent = '已设置，本次运行尚未解锁：查询、导出与设置都被拦截。';
+  } else {
+    btn.textContent = '修改密码';
+    desc.textContent = '已解锁，本次运行内不再询问；重启程序后需重新解锁。';
+  }
+}
+
+function setPwFieldVisible(id: string, visible: boolean): void {
+  const el = $(id);
+  el.hidden = !visible;
+}
+
+function clearPwInputs(): void {
+  for (const id of ['input-pw-old', 'input-pw-new', 'input-pw-confirm'] as const) {
+    ($(id) as HTMLInputElement).value = '';
+  }
+  const err = $('pw-error');
+  err.hidden = true;
+  err.textContent = '';
+}
+
+function openPwModal(
+  mode: PwMode,
+  opts?: { blocking?: boolean; after?: () => Promise<void> },
+): void {
+  pwMode = mode;
+  pwBlocking = Boolean(opts?.blocking);
+  pwPending = opts?.after ?? null;
+  clearPwInputs();
+
+  const title = $('pw-title');
+  const hint = $('pw-hint');
+  const ok = $('pw-ok');
+  const cancel = $('pw-cancel');
+  const forgot = $('pw-forgot');
+  setPwFieldVisible('pw-row-old', false);
+  setPwFieldVisible('pw-row-new', false);
+  setPwFieldVisible('pw-row-confirm', false);
+  forgot.hidden = true;
+  cancel.hidden = pwBlocking;
+
+  switch (mode) {
+    case 'set':
+      title.textContent = '设置访问密码';
+      hint.textContent =
+        '开启「记录输入」前必须设置访问密码。进设置、查数据、导出、清空前都要先输它，本次程序运行内输入一次即可。';
+      setPwFieldVisible('pw-row-new', true);
+      setPwFieldVisible('pw-row-confirm', true);
+      ok.textContent = '设置密码';
+      break;
+    case 'unlock':
+      title.textContent = '输入访问密码';
+      hint.textContent = '录入数据已加密保存。解锁后本次运行内可以查看与修改设置。';
+      setPwFieldVisible('pw-row-new', true);
+      ok.textContent = '解锁';
+      break;
+    case 'change':
+      title.textContent = '修改访问密码';
+      hint.textContent = '';
+      setPwFieldVisible('pw-row-old', true);
+      setPwFieldVisible('pw-row-new', true);
+      setPwFieldVisible('pw-row-confirm', true);
+      forgot.hidden = false;
+      ok.textContent = '确认修改';
+      break;
+    case 'reset':
+      title.textContent = '重置访问密码';
+      hint.textContent =
+        '忘记原密码时使用。重置不会影响已记录的数据（数据密钥与密码无关），但会立即以新密码生效。';
+      setPwFieldVisible('pw-row-new', true);
+      setPwFieldVisible('pw-row-confirm', true);
+      ok.textContent = '重置密码';
+      break;
+  }
+  showModal('pw-modal');
+  const first = (
+    PW_FIELD_IDS.map((id) => $(id))
+      .find((el) => !el.hidden) as HTMLElement
+  ).querySelector('input');
+  first?.focus();
+}
+
+async function handleLocked(reason: string): Promise<void> {
+  const mask = $('pw-modal');
+  if (mask.classList.contains('show')) return; // 已在弹窗流程中
+  try {
+    await refreshPwStatus();
+  } catch {
+    toast(reason);
+    return;
+  }
+  if (!pwStatus) {
+    toast(reason);
+    return;
+  }
+  if (!pwStatus.set) {
+    toast('开启记录前需要先设置访问密码');
+    openPwModal('set', { blocking: true });
+  } else {
+    openPwModal('unlock', { blocking: true });
+  }
+}
+
+async function submitPw(): Promise<void> {
+  const err = $('pw-error');
+  err.hidden = true;
+  err.textContent = '';
+  const oldV = ($('input-pw-old') as HTMLInputElement).value;
+  const newV = ($('input-pw-new') as HTMLInputElement).value;
+  const confV = ($('input-pw-confirm') as HTMLInputElement).value;
+  try {
+    let st: PasswordStatus | null = null;
+    if (pwMode === 'set' || pwMode === 'reset') {
+      if (newV !== confV) throw new Error('两次输入的密码不一致');
+      st = await call<PasswordStatus>(
+        pwMode === 'set' ? 'input_log_password_set' : 'input_log_password_reset',
+        { password: newV },
+      );
+      toast(pwMode === 'set' ? '访问密码已设置' : '访问密码已重置');
+    } else if (pwMode === 'unlock') {
+      st = await call<PasswordStatus>('input_log_password_verify', { password: newV });
+      if (!st.unlocked) throw new Error('密码不正确');
+      toast('已解锁，本次运行内不再询问');
+    } else {
+      if (newV !== confV) throw new Error('两次输入的密码不一致');
+      st = await call<PasswordStatus>('input_log_password_change', {
+        oldPassword: oldV,
+        newPassword: newV,
+      });
+      toast('访问密码已修改');
+    }
+    pwStatus = st;
+    renderPwRow();
+    hideModal('pw-modal');
+    const after = pwPending;
+    pwPending = null;
+    pwBlocking = false;
+    if (after) await after();
+  } catch (e) {
+    err.textContent = String(e);
+    err.hidden = false;
   }
 }
 
@@ -1576,13 +1830,35 @@ async function configure(patch: { enabled?: boolean; paused?: boolean; gapMinute
   if (st) renderStatus(st);
 }
 
-function onToggleEnabled(checked: boolean): void {
+async function onToggleEnabled(checked: boolean): Promise<void> {
+  if (checked) {
+    // 门禁：开启记录必须已设密码且本次运行已解锁（后端同样强制）
+    const st = pwStatus ?? (await refreshPwStatus().catch(() => null));
+    if (!st) {
+      ($('sw-enabled') as HTMLInputElement).checked = false;
+      return;
+    }
+    if (!st.set) {
+      openPwModal('set', { blocking: true, after: continueEnable });
+      return;
+    }
+    if (!st.unlocked) {
+      openPwModal('unlock', { blocking: true, after: continueEnable });
+      return;
+    }
+  }
   if (checked && localStorage.getItem(LS_CONSENT) !== '1') {
     ($('sw-enabled') as HTMLInputElement).checked = false;
     showModal('consent-modal');
     return;
   }
   void configure({ enabled: checked });
+}
+
+/** 密码设好/解锁后的续动作：回到「打开记录开关」的流程。 */
+async function continueEnable(): Promise<void> {
+  ($('sw-enabled') as HTMLInputElement).checked = true;
+  await onToggleEnabled(true);
 }
 
 async function setTrailEnabled(enabled: boolean): Promise<void> {
@@ -1760,6 +2036,172 @@ async function syncNow(): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------- 数据备份
+
+let backupStatusInfo: BackupStatusInfo | null = null;
+/** 恢复弹窗当前选中的快照时间点；null = 未选。 */
+let restoreSelection: number | null = null;
+/** 恢复弹窗当前展示的快照列表。 */
+let restoreSnapshots: SnapshotMeta[] = [];
+/** 恢复二次确认阶段：false = 选快照，true = 已警告等最终确认。 */
+let restoreConfirmed = false;
+
+function fillBackupForm(cfg: BackupConfig): void {
+  ($('sw-backup') as HTMLInputElement).checked = cfg.enabled;
+  ($('select-backup-interval') as HTMLSelectElement).value = String(cfg.intervalMinutes);
+  ($('input-backup-retain') as HTMLInputElement).value = String(cfg.retentionDays);
+}
+
+function collectBackupConfig(): BackupConfig {
+  return {
+    enabled: ($('sw-backup') as HTMLInputElement).checked,
+    intervalMinutes:
+      Number(($('select-backup-interval') as HTMLSelectElement).value) || 30,
+    retentionDays: Math.max(
+      1,
+      Math.min(365, Number(($('input-backup-retain') as HTMLInputElement).value) || 15),
+    ),
+  };
+}
+
+function renderBackupStatus(st: BackupStatusInfo): void {
+  backupStatusInfo = st;
+  ($('sw-backup') as HTMLInputElement).checked = st.enabled;
+  ($('select-backup-interval') as HTMLSelectElement).value = String(st.intervalMinutes);
+  ($('input-backup-retain') as HTMLInputElement).value = String(st.retentionDays);
+
+  const el = $('backup-status');
+  if (!st.enabled) {
+    el.textContent = st.lastBackupTs
+      ? `自动备份已关闭。上次备份 ${timeStr(st.lastBackupTs)}`
+      : '未开启：开启后按周期把数据库快照上传网盘';
+  } else if (st.lastBackupTs === 0) {
+    el.textContent = '已开启，等待首次备份（开启时立刻做一次）';
+  } else {
+    el.textContent = st.lastMessage || (st.lastOk ? '上次备份成功' : '上次备份失败');
+  }
+  $('backup-last').textContent = st.lastBackupTs ? timeStr(st.lastBackupTs) : '—';
+}
+
+async function refreshBackupStatus(): Promise<void> {
+  const st = await guard(() => call<BackupStatusInfo>('backup_status'));
+  if (st) renderBackupStatus(st);
+}
+
+async function loadBackupConfig(): Promise<void> {
+  const s = await guard(() => call<{ backup: BackupConfig }>('get_settings'));
+  if (s?.backup) fillBackupForm(s.backup);
+  await refreshBackupStatus();
+}
+
+async function saveBackup(): Promise<void> {
+  const cfg = collectBackupConfig();
+  if (cfg.enabled && !backupStatusInfo) {
+    // 状态还没拉到就先拉一次，避免误判同步配置
+    await refreshBackupStatus();
+  }
+  const saved = await guard(() => call<BackupConfig>('backup_configure', { backup: cfg }));
+  if (!saved) return;
+  toast(saved.enabled ? '备份设置已保存，正在做首次快照' : '备份设置已保存');
+  await refreshBackupStatus();
+}
+
+async function backupNow(): Promise<void> {
+  const btn = $('btn-backup-now') as HTMLButtonElement;
+  if (btn.disabled) return;
+  btn.disabled = true;
+  btn.textContent = '备份中…';
+  try {
+    const snap = await guard(() => call<SnapshotMeta>('backup_run_now'));
+    if (snap) {
+      toast(`备份完成：${timeStr(snap.ts)}`);
+      await refreshBackupStatus();
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '立即备份';
+  }
+}
+
+async function openRestoreModal(): Promise<void> {
+  restoreSelection = null;
+  restoreConfirmed = false;
+  $('restore-confirm').hidden = true;
+  ($('restore-ok') as HTMLButtonElement).disabled = true;
+  ($('restore-ok') as HTMLButtonElement).textContent = '恢复';
+  $('restore-empty').textContent = '正在读取网盘快照…';
+  $('restore-empty').hidden = false;
+  showModal('restore-modal');
+  const list = await guard(() => call<SnapshotMeta[]>('backup_list'));
+  if (!list) {
+    hideModal('restore-modal');
+    return;
+  }
+  restoreSnapshots = list;
+  renderRestoreList();
+}
+
+function renderRestoreList(): void {
+  const box = $('restore-list');
+  box.querySelectorAll('.restore-item').forEach((el) => el.remove());
+  const empty = $('restore-empty');
+  if (!restoreSnapshots.length) {
+    empty.textContent = '网盘上还没有快照：先备份一次，或稍等自动备份';
+    empty.hidden = false;
+    return;
+  }
+  empty.hidden = true;
+  for (const snap of restoreSnapshots) {
+    const item = document.createElement('div');
+    item.className =
+      'restore-item' + (snap.ts === restoreSelection ? ' selected' : '');
+    item.textContent = timeStr(snap.ts);
+    if (snap.files.length) {
+      const files = document.createElement('span');
+      files.className = 'restore-files';
+      files.textContent =
+        snap.files.length === 3 ? '含轨迹' : '按键统计';
+      item.appendChild(files);
+    }
+    item.addEventListener('click', () => {
+      restoreSelection = snap.ts;
+      restoreConfirmed = false;
+      $('restore-confirm').hidden = true;
+      ($('restore-ok') as HTMLButtonElement).textContent = '恢复';
+      ($('restore-ok') as HTMLButtonElement).disabled = false;
+      box.querySelectorAll('.restore-item').forEach((el) => el.classList.remove('selected'));
+      item.classList.add('selected');
+    });
+    box.appendChild(item);
+  }
+}
+
+async function confirmRestore(): Promise<void> {
+  if (restoreSelection == null) return;
+  // 两段式确认：第一下只弹警告
+  if (!restoreConfirmed) {
+    restoreConfirmed = true;
+    $('restore-confirm').hidden = false;
+    ($('restore-ok') as HTMLButtonElement).textContent = '确认恢复';
+    return;
+  }
+  const btn = $('restore-ok') as HTMLButtonElement;
+  btn.disabled = true;
+  btn.textContent = '恢复中…';
+  const report = await guard(() => call<RestoreReport>('backup_restore', { ts: restoreSelection }));
+  if (report) {
+    hideModal('restore-modal');
+    toast(`已恢复：${report.restored.join('、')}`);
+    // 数据被整库替换：状态、图表、应用列表全部重新拉
+    await refreshStatus();
+    await refreshBackupStatus();
+    void loadStats();
+  } else {
+    btn.disabled = false;
+    btn.textContent = '确认恢复';
+  }
+}
+
 // ---------------------------------------------------------------- 页面切换
 
 function switchPage(page: string): void {
@@ -1861,6 +2303,16 @@ function bindEvents(): void {
   // 开关切换 = 立即按当前表单保存（与其它开关「改动立即生效」的行为一致）
   ($('sw-sync') as HTMLInputElement).addEventListener('change', () => {
     void saveSync();
+  });
+
+  // ---- 数据备份 ----
+  $('btn-backup-save').addEventListener('click', () => void saveBackup());
+  $('btn-backup-now').addEventListener('click', () => void backupNow());
+  $('btn-backup-list').addEventListener('click', () => void openRestoreModal());
+  $('restore-cancel').addEventListener('click', () => hideModal('restore-modal'));
+  $('restore-ok').addEventListener('click', () => void confirmRestore());
+  ($('sw-backup') as HTMLInputElement).addEventListener('change', () => {
+    void saveBackup();
   });
 
   // ---- 分类 ----
@@ -2135,6 +2587,31 @@ function bindEvents(): void {
     void configure({ enabled: true });
   });
 
+  // 访问密码：入口按钮 + 弹窗内按钮 + 输入框回车提交
+  $('pw-manage').addEventListener('click', () => {
+    const st = pwStatus;
+    if (!st) {
+      void refreshPwStatus().then(() => openPwModal(pwStatus?.set ? 'change' : 'set'));
+      return;
+    }
+    openPwModal(st.set ? 'change' : 'set');
+  });
+  $('pw-cancel').addEventListener('click', () => {
+    pwPending = null;
+    pwBlocking = false;
+    hideModal('pw-modal');
+  });
+  $('pw-forgot').addEventListener('click', () => openPwModal('reset'));
+  $('pw-ok').addEventListener('click', () => void submitPw());
+  for (const id of ['input-pw-old', 'input-pw-new', 'input-pw-confirm'] as const) {
+    ($(id) as HTMLInputElement).addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        void submitPw();
+      }
+    });
+  }
+
   // 轨迹采样告知
   $('trail-cancel').addEventListener('click', () => hideModal('trail-modal'));
   $('trail-ok').addEventListener('click', () => {
@@ -2179,17 +2656,25 @@ function bindEvents(): void {
 
   document.querySelectorAll<HTMLElement>('.modal-mask').forEach((mask) => {
     mask.addEventListener('click', (ev) => {
+      // 阻塞态的密码弹窗不允许点遮罩关掉
+      if (mask.id === 'pw-modal' && pwBlocking) return;
       if (ev.target === mask) mask.classList.remove('show');
     });
   });
 
   window.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape') {
-      document.querySelectorAll<HTMLElement>('.modal-mask.show').forEach((m) => m.classList.remove('show'));
+      document.querySelectorAll<HTMLElement>('.modal-mask.show').forEach((m) => {
+        if (m.id === 'pw-modal' && pwBlocking) return;
+        m.classList.remove('show');
+      });
       pendingRetentionDays = null;
       editingCatId = null;
       pendingDeleteCatId = null;
       closeCatQuickDrop();
+      // 恢复弹窗的两段式确认也要复位，Esc 后再打开不该停在警告态
+      restoreSelection = null;
+      restoreConfirmed = false;
     }
   });
 
@@ -2232,9 +2717,20 @@ async function boot(): Promise<void> {
     if (document.getElementById('page-stats')?.classList.contains('active')) void loadStats();
   });
 
+  // 门禁前置：已设密码但本次运行还没解锁 → 一进窗口就弹解锁窗。
+  // 之后的 refreshStatus 会拿不到数据，但 handleLocked 看到弹窗已开不会重复弹。
+  try {
+    const st = await refreshPwStatus();
+    if (st.set && !st.unlocked) openPwModal('unlock', { blocking: true });
+  } catch {
+    /* 密码状态不可用时保持静默，后续命令的 LOCKED 错误会兜底 */
+  }
+
   await refreshStatus();
   // 同步配置与状态独立于 LogStatus，单独拉一次
   void loadSyncConfig();
+  // 备份配置与状态同理
+  void loadBackupConfig();
 
   // 调试用：stats.html?page=stats 直接打开某一页
   const wanted = new URLSearchParams(location.search).get('page');

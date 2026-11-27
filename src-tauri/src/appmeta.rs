@@ -10,9 +10,12 @@
 //! 结果按进程名缓存在进程内：切页、重进统计窗口都不重复解析（图标提取要加载资源，最贵）。
 //! 查不到的字段一律 `None`，由前端降级成首字母占位，不报错。
 
+use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 /// 图标取多大。前端按 40px 显示，48 在 2x 屏上也不糊。
 #[cfg(windows)]
@@ -38,6 +41,91 @@ fn cache() -> &'static Mutex<HashMap<String, AppMeta>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+// ---------------------------------------------------------------------------
+// ⑤ 图标本地缓存（meta.db 的 app_icons 表）
+//
+// 图标本来只活在进程内存里，重启就没了；而且对方机器同步来的数据在本机
+// 现查不到（软件没装），只能永远占位符。这里给图标加一层落盘缓存：
+// 现查成功 → 整行刷新（程序在跑时路径最准，天然就是「打开程序时更新」）；
+// 现查失败 → 回查缓存兜底（「否则就用旧图标」，含同步带来的）。
+// ---------------------------------------------------------------------------
+
+fn icon_db_path() -> PathBuf {
+    crate::recorder::log_dir().join("meta.db")
+}
+
+/// 打开 meta.db 并确保 app_icons 表存在。库不存在返回 None——图标缓存只是
+/// 展示性数据，绝不为了它把 meta.db 先建出来（那是 recorder 的地盘）。
+fn open_icon_db() -> Option<Connection> {
+    let path = icon_db_path();
+    if !path.exists() {
+        return None;
+    }
+    let conn = crate::crypto::open_log_db(&path, "meta.db").ok()?;
+    conn.busy_timeout(Duration::from_millis(2000)).ok()?;
+    if conn
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS app_icons (
+                 process TEXT PRIMARY KEY,
+                 icon    TEXT NOT NULL
+             ) WITHOUT ROWID;",
+        )
+        .is_err()
+    {
+        return None;
+    }
+    Some(conn)
+}
+
+/// 现查成功的图标写进本地缓存。失败静默：图标缓存坏了不能影响统计展示。
+fn persist_icons(metas: &[AppMeta]) {
+    let fresh: Vec<(&str, &str)> = metas
+        .iter()
+        .filter_map(|m| m.icon.as_deref().map(|i| (m.process.as_str(), i)))
+        .collect();
+    if fresh.is_empty() {
+        return;
+    }
+    let Some(conn) = open_icon_db() else {
+        return;
+    };
+    for (process, icon) in fresh {
+        let _ = conn.execute(
+            "INSERT INTO app_icons(process, icon) VALUES(?1, ?2)
+             ON CONFLICT(process) DO UPDATE SET icon = excluded.icon",
+            params![process, icon],
+        );
+    }
+}
+
+/// 现查不到图标的进程，回查本地缓存兜底。缓存里也没有就维持 None，
+/// 前端照旧降级成首字母占位。
+fn fill_icons_from_cache(metas: &mut [AppMeta]) {
+    let missing: Vec<&str> = metas
+        .iter()
+        .filter(|m| m.icon.is_none())
+        .map(|m| m.process.as_str())
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    let Some(conn) = open_icon_db() else {
+        return;
+    };
+    for m in metas.iter_mut() {
+        if m.icon.is_some() {
+            continue;
+        }
+        if let Ok(icon) = conn.query_row(
+            "SELECT icon FROM app_icons WHERE process = ?1",
+            params![m.process],
+            |r| r.get::<_, String>(0),
+        ) {
+            m.icon = Some(icon);
+        }
+    }
+}
+
 /// 批量解析。同步实现，调用方负责放到阻塞线程池里跑。
 pub fn resolve_many(processes: Vec<String>) -> Vec<AppMeta> {
     #[cfg(windows)]
@@ -46,9 +134,7 @@ pub fn resolve_many(processes: Vec<String>) -> Vec<AppMeta> {
     }
     #[cfg(not(windows))]
     {
-        // macOS/Linux 侧没有等价实现（需要 NSWorkspace / .desktop 解析），先只回进程名，
-        // 前端会自动降级成首字母占位，不显示路径。
-        processes
+        let mut out: Vec<AppMeta> = processes
             .into_iter()
             .map(|p| AppMeta {
                 process: p,
@@ -57,14 +143,17 @@ pub fn resolve_many(processes: Vec<String>) -> Vec<AppMeta> {
                 exe_path: None,
                 icon: None,
             })
-            .collect()
+            .collect();
+        // 本机解析不了（无 NSWorkspace / .desktop 实现），但同步带来的缓存图标可用
+        fill_icons_from_cache(&mut out);
+        out
     }
 }
 
 #[cfg(windows)]
 fn resolve_many_windows(processes: Vec<String>) -> Vec<AppMeta> {
     let running = running_process_paths();
-    let mut out = Vec::with_capacity(processes.len());
+    let mut out: Vec<AppMeta> = Vec::with_capacity(processes.len());
     for raw in processes {
         let key = raw.to_ascii_lowercase();
         {
@@ -82,6 +171,10 @@ fn resolve_many_windows(processes: Vec<String>) -> Vec<AppMeta> {
         }
         out.push(meta);
     }
+    // 打开程序时更新图标：现查成功的整行刷新进本地缓存
+    persist_icons(&out);
+    // 现查失败的（本机没装的软件、抽图标失败的）用缓存里的旧图标兜底
+    fill_icons_from_cache(&mut out);
     out
 }
 
